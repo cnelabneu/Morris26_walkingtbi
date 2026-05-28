@@ -7,11 +7,12 @@ format:
 editor: visual
 editor_options:
   chunk_output_group: inline
+  author: "Timothy P Morris"
 ---
 
 # Roybal Final Data Analysis — Feasibility & Compliance
 
-**Purpose:** This document covers feasibility of intervention delivery and study procedures, and participant compliance outcomes from the Roybal pilot RCT.
+**Purpose:** This document covers feasibility of intervention delivery and study procedures, and participant compliance outcomes from the Roybal pilot RCT\~
 
 ------------------------------------------------------------------------
 

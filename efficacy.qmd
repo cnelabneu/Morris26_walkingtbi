@@ -7,11 +7,12 @@ format:
 editor: visual
 editor_options:
   chunk_output_group: inline
+  author: "Timothy P Morris"
 ---
 
 # Roybal Final Data Analysis — Efficacy
 
-**Purpose:** This document covers preliminary efficacy analyses of walking outcomes from the Roybal pilot RCT.
+**Purpose:** This document covers preliminary efficacy analyses of walking outcomes from the Roybal pilot RCT\~
 
 ------------------------------------------------------------------------
 

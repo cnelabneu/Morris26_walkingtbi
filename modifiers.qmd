@@ -6,7 +6,7 @@ author: "Timothy P Morris"
 
 # Roybal Final Data Analysis — Modifiers
 
-**Purpose:** This document covers modifier analyses of walking outcomes from the Roybal pilot RCT.
+**Purpose:** This document covers modifier analyses of walking outcomes from the Roybal pilot RCT\~
 
 ## Load data
 

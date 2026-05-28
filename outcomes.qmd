@@ -1,11 +1,12 @@
 ---
 title: "Roybal - Outcomes"
 format: html
+author: "Timothy P Morris"
 ---
 
 # Roybal Final Data Analysis — Outcomes
 
-**Purpose:** This document covers exploratory outcome analyses of cogntive outcomes from the Roybal pilot RCT.
+**Purpose:** This document covers exploratory outcome analyses of cogntive outcomes from the Roybal pilot RCT\~
 
 ### Load data
 
