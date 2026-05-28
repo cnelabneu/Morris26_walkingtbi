@@ -1,0 +1,947 @@
+---
+title: "Modifiers"
+format: html
+author: "Timothy P Morris"
+---
+
+# Roybal Final Data Analysis — Modifiers
+
+**Purpose:** This document covers modifier analyses of walking outcomes from the Roybal pilot RCT.
+
+## Load data
+
+```{r}
+load("roybal_base.RData")
+
+# environment_vars — derived from completed (replaces broken original file path)
+environment_vars <- completed %>%
+  select(id, pc_park, urban_type, NatWalkInd)
+
+base_vars <- completed %>%
+  select(id, cog_func_tscore, gph_tscore, gmh_tscore, total_MET_min,
+         breq3_intrinsic_baseline, breq3_amotivation_baseline,
+         selfeff_total_score_baseli, age2, sex_cat, years_of_ed, days_since_injury)
+
+mod_vars <- left_join(base_vars, environment_vars)
+
+# Scale person-level vars
+mod_vars <- mod_vars %>%
+  mutate(across(c(NatWalkInd, pc_park, cog_func_tscore, gph_tscore, gmh_tscore,
+                  breq3_intrinsic_baseline, breq3_amotivation_baseline,
+                  selfeff_total_score_baseli, age2, years_of_ed, days_since_injury),
+                ~ as.numeric(scale(.)),
+                .names = "{.col}_z"))
+
+# Process daily weather — take first walk record per day, filter to weeks 1-12, scale within-participant
+dailyweather_filt <- weather_raw %>%
+  arrange(participant_id, day, desc(has_walk_at_least_27min == "true")) %>%
+  group_by(participant_id, day) %>%
+  slice(1) %>%
+  ungroup() %>%
+  filter(week <= 12) %>%
+  group_by(participant_id) %>%
+  mutate(across(c(avg_temp_f, precip_in, cloud_cover_pct), ~ as.numeric(scale(.)))) %>%
+  ungroup()
+
+# Merge baseline vars to daily df
+dailyweather_filt$participant_id <- tolower(dailyweather_filt$participant_id)
+mod_vars$id <- tolower(mod_vars$id)
+
+mods_final <- left_join(dailyweather_filt, mod_vars, by = c("participant_id" = "id")) %>%
+  distinct()
+
+mods_final <- mods_final %>%
+  mutate(
+    has_walk_at_least_27min = factor(has_walk_at_least_27min, levels = c("False", "True")),
+    has_completed_walk      = factor(has_completed_walk,      levels = c("False", "True")),
+    participant_id          = factor(participant_id)
+  )
+
+# create season var
+
+  weekly_walks <- weekly_walks %>%
+  mutate(
+    midpoint = as.Date(official_start_date) + 
+               as.numeric(as.Date(official_end_date) - as.Date(official_start_date)) / 2,
+    mid_md = as.integer(format(midpoint, "%m%d")),
+    season = case_when(
+      mid_md >= 320  & mid_md < 621  ~ "Spring",
+      mid_md >= 621  & mid_md < 923  ~ "Summer",
+      mid_md >= 923  & mid_md < 1221 ~ "Fall",
+      mid_md >= 1221 | mid_md < 320  ~ "Winter"
+    )
+  ) %>%
+  select(-midpoint, -mid_md)
+
+
+#extract one season value per participant and join to mods_final
+season_lookup <- weekly_walks %>%
+  distinct(id, season) %>%
+  mutate(id = tolower(id))
+
+mods_final <- left_join(mods_final, season_lookup, by = c("participant_id" = "id"))
+
+# mods_final <- mods_final %>% select(-season.y)
+
+# mods_final <- mods_final %>%
+#    rename(season = `season.x`)
+
+mods_final$season <- factor(mods_final$season, levels = c("Winter", "Spring", "Summer", "Fall"))
+
+  
+  
+```
+
+### models
+
+```{r}
+library(lme4)
+library(broom.mixed)
+
+# All candidate demographics (using scaled _z versions)
+demographics <- c("age2_z", "sex_cat", "years_of_ed_z", "days_since_injury_z", "type", "month")
+
+# Opportunity model: environmental vars
+# avg_temp_f, precip_in, cloud_cover_pct already within-person scaled in mods_final
+# NatWalkInd_z, pc_park_z are person-level scaled; urban_type is categorical
+env_vars <- c("avg_temp_f", "precip_in", "cloud_cover_pct",
+              "NatWalkInd_z", "pc_park_z", "urban_type", "season")
+
+# Capability model: psychosocial vars
+psy_vars <- c("gph_tscore", "gmh_tscore", "cog_func_tscore")
+
+# Motivation model: motivational vars
+mot_vars <- c("breq3_intrinsic_baseline_z", "breq3_amotivation_baseline_z",
+              "selfeff_total_score_baseli_z")
+
+fit_glmer <- function(predictors, label) {
+  f <- paste("has_walk_at_least_27min ~",
+             paste(predictors, collapse = " + "),
+             "+ (1 | participant_id)")
+  cat(sprintf("\n=== %s model ===\n", label))
+  cat(sprintf("Formula: %s\n", f))
+  tryCatch(
+    glmer(as.formula(f), data = mods_final, family = binomial,
+          control = glmerControl(optimizer = "bobyqa")),
+    error = function(e) { cat("Model failed:", conditionMessage(e), "\n"); NULL }
+  )
+}
+
+# --- Step 1: Demographics-only model ---
+# Fit demographics alone to identify which covariates are independently
+# associated with the outcome before adding domain-specific predictors.
+mod_demographics <- fit_glmer(demographics, "Demographics only")
+cat("\n\n========== Demographics-only Model Summary ==========\n")
+print(summary(mod_demographics))
+
+# Extract significant demographic terms (p < .05, excluding intercept).
+# Strip dummy suffixes (e.g. "typeB" → "type") to recover the original
+# variable name so the whole factor is retained or dropped together.
+sig_demo_terms <- tidy(mod_demographics, effects = "fixed") %>%
+  filter(term != "(Intercept)", p.value < 0.05) %>%
+  pull(term)
+
+sig_demographics <- demographics[sapply(demographics,
+                                        function(v) any(startsWith(sig_demo_terms, v)))]
+
+cat(sprintf("\nSignificant demographic(s) (p < .05): %s\n",
+            paste(sig_demographics, collapse = ", ")))
+cat("These will be carried forward into the domain models.\n")
+
+# --- Step 2: Domain models with only significant demographics ---
+mod_opportunity <- fit_glmer(c(env_vars, sig_demographics), "Opportunity")
+mod_capability  <- fit_glmer(c(psy_vars, sig_demographics),  "Capability")
+mod_motivation  <- fit_glmer(c(mot_vars, sig_demographics),  "Motivation")
+
+# Summaries
+for (nm in c("Opportunity", "Capability", "Motivation")) {
+  m <- get(paste0("mod_", tolower(nm)))
+  cat(sprintf("\n\n========== %s Model Summary ==========\n", nm))
+  if (!is.null(m)) print(summary(m)) else cat("  Model unavailable.\n")
+}
+
+# Odds ratio tables
+or_tables <- lapply(
+  list(Opportunity = mod_opportunity,
+       Capability  = mod_capability,
+       Motivation  = mod_motivation),
+  function(m) {
+    if (is.null(m)) return(NULL)
+    tidy(m, effects = "fixed", exponentiate = TRUE, conf.int = TRUE) %>%
+      filter(term != "(Intercept)")
+  }
+)
+
+cat("\n\n========== Opportunity OR Table ==========\n"); print(or_tables$Opportunity)
+cat("\n========== Capability OR Table ==========\n");  print(or_tables$Capability)
+cat("\n========== Motivation OR Table ==========\n");  print(or_tables$Motivation)
+```
+
+### Plots
+
+```{r}
+library(ggplot2)
+
+# Combine OR tables from the three domain models into one dataframe.
+# or_tables is a named list (Opportunity, Capability, Motivation) already
+# extracted in the models chunk above with exponentiate = TRUE, conf.int = TRUE.
+# Publication labels: maps tidy() term names to display labels.
+# Factor dummies follow the pattern <varname><level> (e.g. "seasonSummer").
+# If a term name differs in your data, update the left-hand side accordingly.
+term_labels <- c(
+  "typeIntervention"             = "Intervention",
+  "pc_park_z"                    = "%Greenspace",
+  "seasonSummer"                 = "Summer (v Winter)",
+  "cloud_cover_pct"              = "%Cloud cover",
+  "avg_temp_f"                   = "Daily temperature (°F)",
+  "urban_typeUrban"              = "Urban v Rural",
+  "precip_in"                    = "Daily precipitation (mm)",
+  "NatWalkInd_z"                 = "Walkability Index",
+  "seasonFall"                   = "Fall (v Winter)",
+  "seasonSpring"                 = "Spring (v Winter)",
+  "gph_tscore"                   = "Physical health",
+  "gmh_tscore"                   = "Mental health",
+  "cog_func_tscore"              = "Perceived cognition",
+  "breq3_intrinsic_baseline_z"   = "Intrinsic motivation",
+  "breq3_amotivation_baseline_z" = "Amotivation",
+  "selfeff_total_score_baseli_z" = "Exercise self-efficacy"
+)
+
+or_forest <- bind_rows(
+  or_tables$Opportunity %>% mutate(model = "Opportunity"),
+  or_tables$Capability  %>% mutate(model = "Capability"),
+  or_tables$Motivation  %>% mutate(model = "Motivation")
+) %>%
+  mutate(
+    model        = factor(model, levels = c("Opportunity", "Capability", "Motivation")),
+    term_display = dplyr::recode(term, !!!term_labels),
+    term_display = reorder(term_display, estimate)
+  )
+
+# Stacked forest plot — one panel per domain model, all predictors shown.
+# Points are coloured by direction (OR > 1 = positive, OR < 1 = negative).
+ggplot(or_forest, aes(x = estimate, y = term_display, colour = estimate > 1)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.25, linewidth = 0.7) +
+  geom_point(size = 2.8) +
+  scale_x_log10() +
+  scale_colour_manual(values = c("TRUE" = "#D55E00", "FALSE" = "#0072B2"),
+                      guide  = "none") +
+  facet_grid(model ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title    = "Odds Ratios",
+    subtitle = "Outcome: Daily 30 minute Walk | error bars = 95% CI",
+    x        = "Odds Ratio (log scale)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+    strip.text    = element_text(face = "bold", size = 13),
+    panel.spacing = unit(1, "lines")
+  )
+
+
+# ---- Predicted probability plots by focal predictor and group (type) ----
+library(ggeffects)
+
+# Helper: predicted probability ribbon plot from a glmer model.
+# focal_term: ggpredict term string for the x-axis variable (e.g. "avg_temp_f [n=100]")
+# x_label:    x-axis label for the plot
+# title:      plot title
+pred_prob_plot <- function(model, focal_term, x_label, title) {
+  preds <- ggpredict(model,
+                     terms = c(focal_term, "type"),
+                     type  = "fixed")
+  ggplot(preds, aes(x = x, y = predicted, color = group, fill = group)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+    geom_line(linewidth = 1.2) +
+    scale_color_manual(values = c("Control" = "#40B0A6", "Intervention" = "#D55E00")) +
+    scale_fill_manual(values  = c("Control" = "#40B0A6", "Intervention" = "#D55E00")) +
+    scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+    labs(
+      title = title,
+      x     = x_label,
+      y     = "Predicted Probability of Walking ≥27 min",
+      color = "Group", fill = "Group"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title      = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+# Intrinsic motivation (Motivation model)
+pred_prob_plot(mod_motivation,
+               "breq3_intrinsic_baseline_z [n=100]",
+               "Intrinsic Motivation (z-scored)",
+               "Predicted Probability of Walking by Intrinsic Motivation")
+
+# Daily temperature (Opportunity model)
+pred_prob_plot(mod_opportunity,
+               "avg_temp_f [n=100]",
+               "Daily Temperature (°F, within-person z-scored)",
+               "Predicted Probability of Walking by Daily Temperature")
+
+# Daily precipitation (Opportunity model)
+pred_prob_plot(mod_opportunity,
+               "precip_in [n=100]",
+               "Daily Precipitation (mm, within-person z-scored)",
+               "Predicted Probability of Walking by Daily Precipitation")
+
+# Perceived cognition (Capability model)
+pred_prob_plot(mod_capability,
+               "cog_func_tscore [n=100]",
+               "Perceived Cognition (T-score)",
+               "Predicted Probability of Walking by Perceived Cognition")
+```
+
+### OR Tables
+
+```{r}
+library(kableExtra)
+
+# Combine OR tables, apply publication labels, and add model column.
+# tidy() returns log-scale estimates; re-extracting with exponentiate = FALSE
+# gives the SE and z-stat on the log scale (correct), while ORs and CIs are
+# exponentiated for display.
+or_table_combined <- bind_rows(
+  or_tables$Opportunity %>% mutate(model = "Opportunity"),
+  or_tables$Capability  %>% mutate(model = "Capability"),
+  or_tables$Motivation  %>% mutate(model = "Motivation")
+) %>%
+  mutate(
+    term = dplyr::recode(term, !!!term_labels)
+  ) %>%
+  select(model, term, estimate, conf.low, conf.high, std.error, statistic) %>%
+  mutate(
+    across(c(estimate, conf.low, conf.high), ~ round(., 2)),
+    std.error = round(std.error, 3),
+    statistic = round(statistic, 2)
+  ) %>%
+  rename(
+    Predictor  = term,
+    OR         = estimate,
+    `95% CI Lower` = conf.low,
+    `95% CI Upper` = conf.high,
+    SE         = std.error,
+    `z`        = statistic
+  )
+
+# Row counts per model for pack_rows grouping
+n_opp <- sum(or_table_combined$model == "Opportunity")
+n_cap <- sum(or_table_combined$model == "Capability")
+n_mot <- sum(or_table_combined$model == "Motivation")
+
+or_table_combined %>%
+  select(-model) %>%
+  kable(
+    caption = "Odds Ratios for Opportunity, Capability, and Motivation Models (Outcome: Daily 30-min Walk)",
+    align   = c("l", "c", "c", "c", "c", "c")
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  column_spec(1, bold = TRUE, width = "16em") %>%
+  pack_rows("Opportunity", 1,          n_opp,                    bold = TRUE, italic = FALSE) %>%
+  pack_rows("Capability",  n_opp + 1,  n_opp + n_cap,            bold = TRUE, italic = FALSE) %>%
+  pack_rows("Motivation",  n_opp + n_cap + 1, n_opp + n_cap + n_mot,
+            bold = TRUE, italic = FALSE)
+```
+
+### Models: has_completed_walk outcome
+
+```{r}
+fit_glmer_cw <- function(predictors, label) {
+  f <- paste("has_completed_walk ~",
+             paste(predictors, collapse = " + "),
+             "+ (1 | participant_id)")
+  cat(sprintf("\n=== %s model (has_completed_walk) ===\n", label))
+  cat(sprintf("Formula: %s\n", f))
+  tryCatch(
+    glmer(as.formula(f), data = mods_final, family = binomial,
+          control = glmerControl(optimizer = "bobyqa")),
+    error = function(e) { cat("Model failed:", conditionMessage(e), "\n"); NULL }
+  )
+}
+
+# --- Step 1: Demographics-only model ---
+mod_demographics_cw <- fit_glmer_cw(demographics, "Demographics only")
+cat("\n\n========== Demographics-only Model Summary (has_completed_walk) ==========\n")
+print(summary(mod_demographics_cw))
+
+# Extract significant demographic terms (p < .05), collapsing dummy suffixes
+# back to the original variable name so whole factors are kept or dropped.
+sig_demo_terms_cw <- tidy(mod_demographics_cw, effects = "fixed") %>%
+  filter(term != "(Intercept)", p.value < 0.05) %>%
+  pull(term)
+
+sig_demographics_cw <- demographics[sapply(demographics,
+                                           function(v) any(startsWith(sig_demo_terms_cw, v)))]
+
+cat(sprintf("\nSignificant demographic(s) (p < .05): %s\n",
+            paste(sig_demographics_cw, collapse = ", ")))
+cat("These will be carried forward into the domain models.\n")
+
+# --- Step 2: Domain models with only significant demographics ---
+mod_opportunity_cw <- fit_glmer_cw(c(env_vars, sig_demographics_cw), "Opportunity")
+mod_capability_cw  <- fit_glmer_cw(c(psy_vars, sig_demographics_cw),  "Capability")
+mod_motivation_cw  <- fit_glmer_cw(c(mot_vars, sig_demographics_cw),  "Motivation")
+
+# Summaries
+for (nm in c("Opportunity", "Capability", "Motivation")) {
+  m <- get(paste0("mod_", tolower(nm), "_cw"))
+  cat(sprintf("\n\n========== %s Model Summary (has_completed_walk) ==========\n", nm))
+  if (!is.null(m)) print(summary(m)) else cat("  Model unavailable.\n")
+}
+
+# Odds ratio tables
+or_tables_cw <- lapply(
+  list(Opportunity = mod_opportunity_cw,
+       Capability  = mod_capability_cw,
+       Motivation  = mod_motivation_cw),
+  function(m) {
+    if (is.null(m)) return(NULL)
+    tidy(m, effects = "fixed", exponentiate = TRUE, conf.int = TRUE) %>%
+      filter(term != "(Intercept)")
+  }
+)
+
+cat("\n\n========== Opportunity OR Table (has_completed_walk) ==========\n"); print(or_tables_cw$Opportunity)
+cat("\n========== Capability OR Table (has_completed_walk) ==========\n");  print(or_tables_cw$Capability)
+cat("\n========== Motivation OR Table (has_completed_walk) ==========\n");  print(or_tables_cw$Motivation)
+```
+
+### Backward Elimination: has_completed_walk
+
+```{r}
+# Backward elimination for a single glmer model.
+# At each iteration, the fixed effect with the largest p-value above `threshold`
+# is dropped. Only one variable is removed per iteration. The loop stops when
+# all remaining fixed effects have p <= threshold, or only one predictor remains.
+#
+# Note: p-values from glmer (Wald z) are approximate. They are used here purely
+# as a guide for variable removal, not for formal inference on the final model.
+
+backward_glmer <- function(predictors, outcome, label, threshold = 0.1) {
+
+  current_preds <- predictors
+
+  cat(sprintf("\n\n========== Backward Elimination: %s (%s) ==========\n",
+              label, outcome))
+
+  iteration <- 0
+
+  repeat {
+    iteration <- iteration + 1
+
+    f <- paste(outcome, "~",
+               paste(current_preds, collapse = " + "),
+               "+ (1 | participant_id)")
+
+    m <- tryCatch(
+      glmer(as.formula(f), data = mods_final, family = binomial,
+            control = glmerControl(optimizer = "bobyqa")),
+      error = function(e) {
+        cat("  Model failed:", conditionMessage(e), "\n")
+        NULL
+      }
+    )
+
+    if (is.null(m)) break
+
+    # Extract fixed-effect p-values, excluding the intercept
+    coef_tbl <- tidy(m, effects = "fixed") %>%
+      filter(term != "(Intercept)") %>%
+      arrange(desc(p.value))
+
+    # Find the worst offender
+    worst     <- coef_tbl$term[1]
+    worst_p   <- coef_tbl$p.value[1]
+
+    cat(sprintf("\n--- Iteration %d | %d predictor(s) ---\n", iteration, length(current_preds)))
+    print(coef_tbl %>% select(term, estimate, std.error, statistic, p.value))
+
+    if (worst_p <= threshold) {
+      cat(sprintf("\n  All p-values <= %.2f. Stopping.\n", threshold))
+      break
+    }
+
+    cat(sprintf("\n  Removing '%s' (p = %.4f)\n", worst, worst_p))
+
+    # Remove the term from the predictor list.
+    # strip dummy suffixes so we remove the whole factor at once
+    # (e.g. "urban_typeSuburban" -> remove "urban_type")
+    base_term <- current_preds[sapply(current_preds,
+                                      function(v) startsWith(worst, v))]
+    if (length(base_term) == 0) base_term <- worst
+    current_preds <- setdiff(current_preds, base_term[1])
+
+    if (length(current_preds) == 0) {
+      cat("  No predictors remaining. Stopping.\n")
+      break
+    }
+  }
+
+  # Return the final model
+  f_final <- paste(outcome, "~",
+                   paste(current_preds, collapse = " + "),
+                   "+ (1 | participant_id)")
+  cat(sprintf("\n  Final formula: %s\n", f_final))
+
+  final_m <- tryCatch(
+    glmer(as.formula(f_final), data = mods_final, family = binomial,
+          control = glmerControl(optimizer = "bobyqa")),
+    error = function(e) { cat("Final model failed:", conditionMessage(e), "\n"); NULL }
+  )
+
+  final_m
+}
+
+# Run backward elimination for all three models
+be_opportunity_cw <- backward_glmer(c(env_vars, demographics),
+                                    "has_completed_walk", "Opportunity")
+
+be_capability_cw  <- backward_glmer(c(psy_vars, demographics),
+                                    "has_completed_walk", "Capability")
+
+be_motivation_cw  <- backward_glmer(c(mot_vars, demographics),
+                                    "has_completed_walk", "Motivation")
+
+# OR tables for the final backward-eliminated models
+or_tables_be_cw <- lapply(
+  list(Opportunity = be_opportunity_cw,
+       Capability  = be_capability_cw,
+       Motivation  = be_motivation_cw),
+  function(m) {
+    if (is.null(m)) return(NULL)
+    tidy(m, effects = "fixed", exponentiate = TRUE, conf.int = TRUE) %>%
+      filter(term != "(Intercept)")
+  }
+)
+
+cat("\n\n========== Opportunity OR Table — Backward Elimination (has_completed_walk) ==========\n")
+print(or_tables_be_cw$Opportunity)
+cat("\n========== Capability OR Table — Backward Elimination (has_completed_walk) ==========\n")
+print(or_tables_be_cw$Capability)
+cat("\n========== Motivation OR Table — Backward Elimination (has_completed_walk) ==========\n")
+print(or_tables_be_cw$Motivation)
+```
+
+### Interaction: NatWalkInd_z × urban_type
+
+Does walkability only predict daily walking in urban-dwelling participants?
+
+```{r}
+# Add NatWalkInd_z × urban_type interaction to the opportunity model
+mod_opportunity_inter <- update(
+  mod_opportunity_cw,
+  . ~ . + NatWalkInd_z:precip_in
+)
+
+summary(mod_opportunity_inter)
+
+# Likelihood ratio test: does the interaction improve model fit?
+lrt_natwalk_urban <- anova(mod_opportunity_cw, mod_opportunity_inter, test = "Chisq")
+print(lrt_natwalk_urban)
+
+# OR table for the interaction model
+tidy(mod_opportunity_inter, effects = "fixed", exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)")
+
+# Plot predicted probabilities across the range of NatWalkInd_z, by urban_type
+library(ggeffects)
+ggpredict(mod_opportunity_inter, terms = c("NatWalkInd_z [all]", "urban_type")) |>
+  plot() +
+  labs(
+    title    = "Predicted probability of walking ≥27 min",
+    subtitle = "NatWalkInd_z × urban_type interaction",
+    x        = "Neighborhood walkability (z)",
+    y        = "P(walk ≥27 min)",
+    colour   = "Urban type"
+  )
+```
+
+does having more green space buffer the neg effect of precipitation
+
+```{r}
+# Add NatWalkInd_z × urban_type interaction to the opportunity model
+mod_opportunity_inter <- update(
+  mod_opportunity_cw,
+  . ~ . + NatWalkInd_z:urban_type
+)
+
+summary(mod_opportunity_inter)
+
+# Likelihood ratio test: does the interaction improve model fit?
+lrt_natwalk_urban <- anova(mod_opportunity_cw, mod_opportunity_inter, test = "Chisq")
+print(lrt_natwalk_urban)
+
+# OR table for the interaction model
+tidy(mod_opportunity_inter, effects = "fixed", exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)")
+
+# Plot predicted probabilities across the range of NatWalkInd_z, by urban_type
+library(ggeffects)
+ggpredict(mod_opportunity_inter, terms = c("NatWalkInd_z [all]", "urban_type")) |>
+  plot() +
+  labs(
+    title    = "Predicted probability of walking ≥27 min",
+    subtitle = "NatWalkInd_z × urban_type interaction",
+    x        = "Neighborhood walkability (z)",
+    y        = "P(walk ≥27 min)",
+    colour   = "Urban type"
+  )
+```
+
+### Lasso: Variable Selection (has_completed_walk)
+
+```{r}
+library(tidymodels)
+
+# All candidate predictors across the three theoretical domains
+all_predictors <- c(env_vars, psy_vars, mot_vars, demographics)
+
+# Prepare modelling data: keep only relevant columns, drop NAs
+model_data <- mods_final %>%
+  select(has_completed_walk, participant_id, all_of(all_predictors)) %>%
+  drop_na()
+
+# --- Recipe ---
+# step_novel:    handles unseen factor levels
+# step_dummy:    dummy-codes all nominal predictors (urban_type, season, sex_cat, etc.)
+# step_zv:       removes zero-variance columns after dummy coding
+# step_normalize: standardises all numeric predictors to mean=0, SD=1
+#                 (required for lasso so penalty is applied on a common scale)
+lasso_rec <- recipe(has_completed_walk ~ ., data = model_data) %>%
+  update_role(participant_id, new_role = "ID") %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+  #step_normalize(all_numeric_predictors())
+
+# --- Leave-One-Participant-Out (LOPO) cross-validation ---
+# v = number of unique participants → each fold holds out one participant entirely.
+# Prevents same-participant observations appearing in both train and test sets,
+# which would inflate performance estimates given the daily clustering structure.
+lopo_folds <- group_vfold_cv(
+  model_data,
+  group = "participant_id",
+  v     = n_distinct(model_data$participant_id)
+)
+
+# --- Model: logistic regression with lasso penalty ---
+# mixture = 1 → pure lasso (variable selection)
+# penalty is tuned via CV
+lasso_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = 1
+) %>%
+  set_engine("glmnet")
+
+# --- Workflow ---
+lasso_wf <- workflow() %>%
+  add_recipe(lasso_rec) %>%
+  add_model(lasso_spec)
+
+# --- Penalty grid: 50 values log-spaced from 0.0001 to 1 ---
+penalty_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  levels = 50
+)
+
+# --- Tune across LOPO folds ---
+set.seed(42)
+lasso_res <- tune_grid(
+  lasso_wf,
+  resamples = lopo_folds,
+  grid      = penalty_grid,
+  metrics   = metric_set(mn_log_loss),
+  control   = control_grid(save_pred = TRUE)
+)
+
+# --- CV performance plot ---
+autoplot(lasso_res)
+
+# --- Select penalty using 1-SE rule ---
+# Among all models within 1 SE of minimum log-loss, pick the one with the
+# highest penalty (most regularised / fewest predictors).
+# Appropriate for small N where CV estimates are noisy.
+best_penalty <- select_by_one_std_err(lasso_res, metric = "mn_log_loss", desc(penalty))
+cat(sprintf("Selected penalty (1-SE rule): %.5f
+", best_penalty$penalty))
+
+# Show CV metrics at selected penalty
+lasso_res %>%
+  collect_metrics() %>%
+  filter(.metric == "mn_log_loss") %>%
+  arrange(mean) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# --- Fit final model on full data at chosen penalty ---
+final_wf  <- finalize_workflow(lasso_wf, best_penalty)
+final_fit <- fit(final_wf, data = model_data)
+
+# --- Extract selected predictors and odds ratios ---
+# Only predictors with non-zero coefficients survived the lasso penalty.
+# OR > 1: associated with higher daily probability of completing a walk.
+# OR < 1: associated with lower probability.
+# Absent predictors lacked sufficient signal given N=48.
+coef_tbl <- tidy(final_fit) %>%
+  filter(term != "(Intercept)", estimate != 0) %>%
+  mutate(OR = exp(estimate)) %>%
+  arrange(desc(abs(estimate)))
+
+cat(sprintf("\n=== %d predictor(s) selected ===\n", nrow(coef_tbl)))
+print(coef_tbl %>% select(term, estimate, OR))
+```
+
+### Lasso: Performance Metrics (has_completed_walk)
+
+```{r}
+# Held-out predictions at the selected penalty from LOPO-CV
+# save_pred = TRUE means every fold's test predictions were stored
+cv_preds <- collect_predictions(lasso_res, parameters = best_penalty)
+
+# --- ROC-AUC ---
+# Uses held-out probability estimates across all 48 LOPO folds.
+# event_level = "second" because factor levels are c("False", "True")
+roc_val <- cv_preds %>%
+  roc_auc(truth = has_completed_walk, .pred_True, event_level = "second")
+
+cat(sprintf("CV ROC-AUC: %.3f\n", roc_val$.estimate))
+
+# --- CV log-loss at selected penalty ---
+logloss_val <- lasso_res %>%
+  collect_metrics() %>%
+  filter(.metric == "mn_log_loss") %>%
+  inner_join(best_penalty %>% select(penalty), by = "penalty")
+
+cat(sprintf("CV log-loss: %.3f (SE: %.3f)\n",
+            logloss_val$mean, logloss_val$std_err))
+
+# --- Check predicted probability distribution ---
+# If all probabilities are below 0.5, a fixed 0.5 cutoff will classify
+# everything as "False" (sensitivity = 0, specificity = 1).
+# This indicates class imbalance — use an outcome-informed threshold instead.
+cat("\n--- Predicted probability summary (.pred_True) ---\n")
+print(summary(cv_preds$.pred_True))
+
+outcome_prev <- mean(model_data$has_completed_walk == "True")
+cat(sprintf("Outcome prevalence (prop True): %.3f\n", outcome_prev))
+
+# --- Optimal threshold via Youden's J (maximises sensitivity + specificity) ---
+# More appropriate than 0.5 when classes are imbalanced.
+roc_df <- cv_preds %>%
+  roc_curve(truth = has_completed_walk, .pred_True, event_level = "second")
+
+best_threshold <- roc_df %>%
+  mutate(j_index = sensitivity + specificity - 1) %>%
+  slice_max(j_index, n = 1) %>%
+  pull(.threshold)
+
+cat(sprintf("Optimal threshold (Youden's J): %.3f\n", best_threshold))
+
+# --- Classification metrics at optimal threshold ---
+cv_preds_class <- cv_preds %>%
+  mutate(.pred_class = factor(
+    ifelse(.pred_True >= best_threshold, "True", "False"),
+    levels = c("False", "True")
+  ))
+
+class_metrics <- cv_preds_class %>%
+  metric_set(accuracy, sens, spec)(
+    truth       = has_completed_walk,
+    estimate    = .pred_class,
+    event_level = "second"
+  )
+
+cat("\n--- Classification metrics at Youden's J threshold ---\n")
+print(class_metrics %>% select(.metric, .estimate))
+
+# --- Confusion matrix ---
+cat("\n--- Confusion matrix (LOPO-CV held-out predictions) ---\n")
+cv_preds_class %>%
+  conf_mat(truth = has_completed_walk, estimate = .pred_class) %>%
+  print()
+
+# --- ROC curve ---
+cv_preds %>%
+  roc_curve(truth = has_completed_walk, .pred_True, event_level = "second") %>%
+  autoplot() +
+  labs(
+    title    = "ROC Curve — LOPO-CV held-out predictions",
+    subtitle = "Lasso model | outcome: has_completed_walk",
+    x        = "1 - Specificity",
+    y        = "Sensitivity"
+  )
+```
+
+### Elastic Net: Variable Selection (has_completed_walk)
+
+```{r}
+# Elastic net extends lasso by adding an L2 (ridge) penalty alongside the L1
+# (lasso) penalty. The mixture parameter (alpha in glmnet) controls the blend:
+#   mixture = 1 → pure lasso (sparse); mixture = 0 → pure ridge (all kept).
+# Tuning mixture jointly with penalty allows the model to retain more predictors
+# than lasso while still shrinking noisy coefficients toward zero.
+
+# Reuse the same recipe and LOPO folds from the lasso section above.
+
+# --- Model: logistic regression with elastic net penalty ---
+# Both penalty (lambda) and mixture (alpha) are tuned.
+enet_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet")
+
+# --- Workflow ---
+enet_wf <- workflow() %>%
+  add_recipe(lasso_rec) %>%
+  add_model(enet_spec)
+
+# --- Tuning grid ---
+# 10 penalty values (log-spaced 0.0001–1) × 5 mixture values (0.2–1.0)
+# mixture values < 1 introduce the ridge component that keeps more predictors.
+enet_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  mixture(range = c(0.1, 1.0)),
+  levels = c(penalty = 50, mixture = 5)
+)
+
+# --- Tune across LOPO folds ---
+set.seed(42)
+enet_res <- tune_grid(
+  enet_wf,
+  resamples = lopo_folds,
+  grid      = enet_grid,
+  metrics   = metric_set(mn_log_loss),
+  control   = control_grid(save_pred = TRUE)
+)
+
+# --- CV performance plot ---
+# Each line is one mixture value; x-axis is the penalty (log scale).
+autoplot(enet_res)
+
+# --- Select best hyperparameters using 1-SE rule ---
+# Among all (penalty, mixture) combinations within 1 SE of minimum log-loss,
+# choose the one with the highest penalty (most regularised / fewest predictors).
+best_enet <- select_by_one_std_err(enet_res, metric = "mn_log_loss", desc(penalty))
+cat(sprintf("Selected penalty: %.5f | Selected mixture: %.2f\n",
+            best_enet$penalty, best_enet$mixture))
+
+# Show top CV results
+enet_res %>%
+  collect_metrics() %>%
+  filter(.metric == "mn_log_loss") %>%
+  arrange(mean) %>%
+  slice_head(n = 5) %>%
+  print()
+
+# --- Fit final model on full data at chosen hyperparameters ---
+enet_final_wf  <- finalize_workflow(enet_wf, best_enet)
+enet_final_fit <- fit(enet_final_wf, data = model_data)
+
+# --- Extract selected predictors and odds ratios ---
+# Predictors with non-zero coefficients survived the elastic net penalty.
+enet_coef_tbl <- tidy(enet_final_fit) %>%
+  filter(term != "(Intercept)", estimate != 0) %>%
+  mutate(OR = exp(estimate)) %>%
+  arrange(desc(abs(estimate)))
+
+cat(sprintf("\n=== %d predictor(s) selected by elastic net ===\n", nrow(enet_coef_tbl)))
+print(enet_coef_tbl %>% select(term, estimate, OR))
+```
+
+### Elastic Net: Performance Metrics (has_completed_walk)
+
+```{r}
+# Held-out predictions at the selected (penalty, mixture) from LOPO-CV
+enet_cv_preds <- collect_predictions(enet_res, parameters = best_enet)
+
+# --- ROC-AUC ---
+enet_roc_val <- enet_cv_preds %>%
+  roc_auc(truth = has_completed_walk, .pred_True, event_level = "second")
+
+cat(sprintf("Elastic net CV ROC-AUC: %.3f\n", enet_roc_val$.estimate))
+
+# --- CV log-loss at selected hyperparameters ---
+enet_logloss_val <- enet_res %>%
+  collect_metrics() %>%
+  filter(.metric == "mn_log_loss") %>%
+  inner_join(best_enet %>% select(penalty, mixture), by = c("penalty", "mixture"))
+
+cat(sprintf("Elastic net CV log-loss: %.3f (SE: %.3f)\n",
+            enet_logloss_val$mean, enet_logloss_val$std_err))
+
+# --- Predicted probability summary ---
+cat("\n--- Predicted probability summary (.pred_True) ---\n")
+print(summary(enet_cv_preds$.pred_True))
+
+cat(sprintf("Outcome prevalence (prop True): %.3f\n",
+            mean(model_data$has_completed_walk == "True")))
+
+# --- Optimal threshold via Youden's J ---
+enet_roc_df <- enet_cv_preds %>%
+  roc_curve(truth = has_completed_walk, .pred_True, event_level = "second")
+
+enet_best_threshold <- enet_roc_df %>%
+  mutate(j_index = sensitivity + specificity - 1) %>%
+  slice_max(j_index, n = 1) %>%
+  pull(.threshold)
+
+cat(sprintf("Optimal threshold (Youden's J): %.3f\n", enet_best_threshold))
+
+# --- Classification metrics at optimal threshold ---
+enet_cv_preds_class <- enet_cv_preds %>%
+  mutate(.pred_class = factor(
+    ifelse(.pred_True >= enet_best_threshold, "True", "False"),
+    levels = c("False", "True")
+  ))
+
+enet_class_metrics <- enet_cv_preds_class %>%
+  metric_set(accuracy, sens, spec)(
+    truth       = has_completed_walk,
+    estimate    = .pred_class,
+    event_level = "second"
+  )
+
+cat("\n--- Classification metrics at Youden's J threshold ---\n")
+print(enet_class_metrics %>% select(.metric, .estimate))
+
+# --- Confusion matrix ---
+cat("\n--- Confusion matrix (LOPO-CV held-out predictions) ---\n")
+enet_cv_preds_class %>%
+  conf_mat(truth = has_completed_walk, estimate = .pred_class) %>%
+  print()
+
+# --- Lasso vs elastic net: side-by-side comparison ---
+cat("\n--- Model comparison (LOPO-CV) ---\n")
+comparison_tbl <- tibble(
+  model        = c("Lasso", "Elastic Net"),
+  penalty      = c(best_penalty$penalty, best_enet$penalty),
+  mixture      = c(1.0,                  best_enet$mixture),
+  cv_log_loss  = c(logloss_val$mean,     enet_logloss_val$mean),
+  cv_roc_auc   = c(roc_val$.estimate,    enet_roc_val$.estimate),
+  n_predictors = c(nrow(coef_tbl),       nrow(enet_coef_tbl))
+)
+print(comparison_tbl)
+
+# --- ROC curve ---
+enet_cv_preds %>%
+  roc_curve(truth = has_completed_walk, .pred_True, event_level = "second") %>%
+  autoplot() +
+  labs(
+    title    = "ROC Curve — LOPO-CV held-out predictions",
+    subtitle = "Elastic net model | outcome: has_completed_walk",
+    x        = "1 - Specificity",
+    y        = "Sensitivity"
+  )
+```

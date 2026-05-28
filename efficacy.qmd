@@ -1,0 +1,983 @@
+---
+title: "Roybal - Efficacy"
+format:
+  html:
+    toc: true
+    embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_group: inline
+---
+
+# Roybal Final Data Analysis — Efficacy
+
+**Purpose:** This document covers preliminary efficacy analyses of walking outcomes from the Roybal pilot RCT.
+
+------------------------------------------------------------------------
+
+### Load libraries
+
+```{r}
+pkgs <- c(
+  "readr", "readxl", "tidyverse", "lme4", "lmerTest",
+  "performance", "emmeans", "pwr", "longpower", "simr",
+  "ggplot2", "kableExtra", "broom.mixed", "car", "gridExtra",
+  "ggridges"
+)
+
+install.packages(setdiff(pkgs, rownames(installed.packages())))
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+### Load data
+
+```{r}
+load("roybal_base.RData")
+
+# Filter to weeks 1-12, join covariates, scale days since injury
+weekly_walks <- weekly_walks %>%
+  filter(week <= 12) %>%
+  left_join(
+    completed %>% select(id, age2, sex_cat, years_of_ed, days_since_injury),
+    by = "id"
+  ) %>%
+  mutate(days_since_injury_scaled = scale(days_since_injury)[, 1])
+
+# df and df_means — used for ribbon plots in Model 3 and Model 4 visualizations
+df <- weekly_walks %>%
+  rename(group = type, duration = total_duration_walks) %>%
+  mutate(duration = if_else(id == "Roybal_60" & week == 1, NA_real_, duration))
+
+df_means <- df %>%
+  group_by(group, week) %>%
+  summarise(
+    across(
+      c(weekly_walks, duration, total_steps_in_walks),
+      list(mean = ~ mean(., na.rm = TRUE),
+           se   = ~ sd(., na.rm = TRUE) / sqrt(sum(!is.na(.)))),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+```
+
+## Efficacy
+
+### Model 1: Total Walks Over Time (Group × Week Interaction) - Model + Covariates - both walking criteria (2x+15 mins + \>27mins)
+
+```{r}
+# Adjusted Model (race excluded due to limited sample diversity)
+glmodel1_adj <- glmer(weekly_walks ~ type * week + age2 + sex_cat +
+                      years_of_ed + days_since_injury_scaled + (1 + week | id),
+                      control = glmerControl(optimizer = "bobyqa"),
+                      data = weekly_walks,
+                      family = poisson(link = "log"))
+summary(glmodel1_adj)
+
+# Extract IRRs and CIs
+tidy(glmodel1_adj, effects = "fixed") %>%
+  mutate(
+    IRR = exp(estimate),
+    conf.low = exp(estimate - 1.96 * std.error),
+    conf.high = exp(estimate + 1.96 * std.error)
+  )
+
+
+# Model comparison to check random inercept only vs intercept and slope models - Poisson model shows best fit
+#AIC(glmodel1_adj_i, glmodel1_adj, glmodel1)
+#BIC(glmodel1_adj_i, glmodel1_adj, glmodel1)
+```
+
+### Model 1: Post-hoc Power Analysis (Group × Week Interaction)
+
+```{r}
+# Post-hoc power analysis for the Group × Week interaction term
+# Requires from model summary: estimate, std.error, and statistic (z-value)
+# for the typeIntervention:week term
+
+# --- Extract interaction term from fitted model ---
+coef_summary <- tidy(glmodel1_adj, effects = "fixed")
+
+interaction_term <- coef_summary %>%
+  filter(term == "typeIntervention:week")
+
+log_irr   <- interaction_term$estimate   # log-scale effect size (from Estimate column)
+se        <- interaction_term$std.error  # std error (from Std. Error column)
+z_stat    <- interaction_term$statistic  # z-value (from z value column)
+irr       <- exp(log_irr)               # exponentiated = Incidence Rate Ratio per week
+
+# --- Sample sizes per group ---
+# Pull directly from the model frame (always available after fitting)
+n_per_group <- glmodel1_adj@frame %>%
+  distinct(id, type) %>%
+  count(type, name = "n_participants")
+
+n_total <- sum(n_per_group$n_participants)
+
+# --- Method 1: Wald-based analytical approximation ---
+# Achieved power = P(reject H0 | effect = observed effect, alpha = 0.05)
+# For a two-sided Wald test: power ≈ Φ(|z| − z_{α/2})
+alpha   <- 0.05
+z_alpha <- qnorm(1 - alpha / 2)
+
+power_wald <- pnorm(abs(z_stat) - z_alpha) +   # upper tail
+              pnorm(-abs(z_stat) - z_alpha)      # lower tail (negligible but exact)
+
+cat("=== Post-hoc Power Analysis: Group × Week Interaction ===\n\n")
+cat("Values extracted from model summary:\n")
+cat("  Estimate (log IRR per week):", round(log_irr, 4), "\n")
+cat("  IRR per week               :", round(irr, 4), "\n")
+cat("  Std. Error                 :", round(se, 4), "\n")
+cat("  z-statistic                :", round(z_stat, 4), "\n\n")
+cat("Sample sizes:\n")
+print(n_per_group)
+cat("  Total N                    :", n_total, "\n\n")
+cat("Achieved power (Wald, alpha =", alpha, "):", round(power_wald, 4), "\n")
+
+# --- Method 2: Simulation-based power via simr (more accurate, ~slow) ---
+# Simulates data from the fitted model and re-fits nsim times to estimate
+# the proportion of runs where the interaction p-value < alpha.
+# Uncomment to run — nsim = 500 is reasonable; 1000 is more precise.
+
+#set.seed(42)
+#power_sim <- powerSim(glmodel1_adj,
+                       test = fixed("typeIntervention:week", #method = "z"),
+                       nsim = 500)
+#print(power_sim)
+```
+
+### Model 1: Estimated marginal means at weeks 1, 6, 12 and exponentiated coefficients
+
+```{r}
+# Estimated marginal means from adjusted model
+emm1_adj <- emmeans(glmodel1_adj, ~ type | week, at = list(week = c(1, 6, 12)), type = "response")
+print(emm1_adj)
+
+# Pairwise comparisons: Intervention vs Control at each week
+pairs(emm1_adj, by = "week")
+
+# table this for pub
+
+# Extract EMMs
+emm_table <- emm1_adj %>%
+  as.data.frame() %>%
+  select(week, type, rate) %>%
+  pivot_wider(names_from = type, values_from = rate) %>%
+  mutate(
+    Ratio = Intervention / Control,
+    Ratio_Label = paste0(round(Ratio, 1), "× more")
+  )
+
+print(emm_table)
+
+emm_table_with_p <- emm_table %>%
+  mutate(`P-value` = c("<0.001", "<0.001", "<0.001"))
+
+
+# Create kable table
+table_kable <- emm_table_with_p %>%
+  kbl(caption = "Estimated Marginal Means of Weekly Walks",
+      booktabs = TRUE,
+      align = "c",
+      digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position"),
+                full_width = FALSE)
+
+table_kable
+
+# Save as PDF (requires LaTeX)
+save_kable(table_kable, "emm_table.pdf")
+
+# looking at intervention varibaility week to week
+
+weekly_walks %>%
+  filter(type == "Intervention") %>%
+  group_by(week) %>%
+  summarise(
+    n = n(),
+    mean = mean(weekly_planned_walks, na.rm = TRUE),
+    sd = sd(weekly_planned_walks, na.rm = TRUE),
+    median = median(weekly_planned_walks, na.rm = TRUE),
+    IQR = IQR(weekly_planned_walks, na.rm = TRUE),
+    min = min(weekly_planned_walks, na.rm = TRUE),
+    max = max(weekly_planned_walks, na.rm = TRUE)
+  )
+```
+
+### Proportion of walks that were planned
+
+```{r}
+# proportion of walks that were planned
+walk_proportions <- all_walks %>%
+  filter(type == "Intervention",
+        walk_type != "No walk") %>%
+  filter(week <=12) %>%
+  count(walk_type) %>%
+  mutate(
+    proportion = n / sum(n),
+    percentage = proportion * 100
+  )
+
+print(walk_proportions)
+```
+
+### Model 1: Plot raw data
+
+```{r}
+weekly_walks %>%
+  group_by(type, week) %>%
+  summarise(
+    mean_walks = mean(weekly_walks, na.rm = TRUE),
+    se_walks = sd(weekly_walks, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = week, y = mean_walks, color = type, group = type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_walks - se_walks,
+                    ymax = mean_walks + se_walks),
+                width = 0.3) +
+  # Add horizontal dashed line at Y=5
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black", linewidth = 0.8) +
+  # Add significance stars above x=1, x=6, and x=12
+  annotate("text", x = 1, y = Inf, label = "*",
+           size = 6, vjust = 1.5, color = "black") +
+  annotate("text", x = 6, y = Inf, label = "*",
+           size = 6, vjust = 1.5, color = "black") +
+  annotate("text", x = 12, y = Inf, label = "*",
+           size = 6, vjust = 1.5, color = "black") +
+  scale_color_manual(values = c("Control" = "#FFBE6A",
+                                  "Intervention" = "#40B0A6")) +
+  scale_y_continuous(breaks = seq(0, 7, by = 1)) +
+  labs(
+    title = "Weekly Total Walks Over Time",
+    x = "Week",
+    y = "Number of Walks (Mean ± SE)",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  scale_x_continuous(breaks = 1:12)
+```
+
+### Model 2: Planned walks (Intervention) vs Total walks (Control) - Adjusted Model
+
+```{r}
+# Create outcome variable
+df_long_model2 <- weekly_walks %>%
+  mutate(walks_outcome = ifelse(type == "Intervention",
+                                 weekly_planned_walks,    # For Intervention
+                                 weekly_walks))           # For Control
+
+# Adjusted Model
+glmodel2_adj <- glmer(walks_outcome ~ type * week + age2 + sex_cat +
+                      years_of_ed + days_since_injury_scaled + (1 + week | id),
+                      control = glmerControl(optimizer = "bobyqa"),
+                      data = df_long_model2,
+                      family = poisson(link = "log"))
+summary(glmodel2_adj)
+
+# Extract IRRs and CIs
+tidy(glmodel2_adj, effects = "fixed") %>%
+  mutate(
+    IRR = exp(estimate),
+    conf.low = exp(estimate - 1.96 * std.error),
+    conf.high = exp(estimate + 1.96 * std.error)
+  )
+```
+
+### Model 2: Estimated marginal means at weeks 1, 6, 12
+
+```{r}
+# Estimated marginal means from adjusted model
+emm2_adj <- emmeans(glmodel2_adj, ~ type | week, at = list(week = c(1, 6, 12)), type = "response")
+print(emm2_adj)
+
+# Pairwise comparisons: Intervention vs Control at each week
+pairs(emm2_adj, by = "week")
+
+# Extract EMMs
+emm_table <- emm2_adj %>%
+  as.data.frame() %>%
+  select(week, type, rate) %>%
+  pivot_wider(names_from = type, values_from = rate) %>%
+  mutate(
+    Ratio = Intervention / Control,
+    Ratio_Label = paste0(round(Ratio, 1), "× more")
+  )
+
+print(emm_table)
+
+emm_table_with_p <- emm_table %>%
+  mutate(`P-value` = c("<0.001", "<0.001", "<0.001"))
+
+
+# Create kable table
+table_kable <- emm_table_with_p %>%
+  kbl(caption = "Estimated Marginal Means of Planned (intervention) vs total Walks",
+      booktabs = TRUE,
+      align = "c",
+      digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position"),
+                full_width = FALSE)
+
+table_kable
+```
+
+### Model 2: Plot
+
+```{r}
+df_long_model2 %>%
+  group_by(type, week) %>%
+  summarise(
+    mean_walks = mean(walks_outcome, na.rm = TRUE),
+    se_walks = sd(walks_outcome, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = week, y = mean_walks, color = type, group = type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_walks - se_walks,
+                    ymax = mean_walks + se_walks),
+                width = 0.3) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black", linewidth = 0.8) +
+ scale_color_manual(values = c("Control" = "#FFBE6A",
+                                  "Intervention" = "#40B0A6")) +
+  scale_y_continuous(breaks = seq(0, 6, by = 1)) +
+  labs(
+    title = "Planned Walks (Intervention) vs Total Walks (Control) Over Time",
+    x = "Week",
+    y = "Number of Walks (Mean ± SE)",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  scale_x_continuous(breaks = 1:12)
+```
+
+### Model 2: Visualization with individual trajectories
+
+```{r}
+df_long_model2 %>%
+  ggplot(aes(x = week)) +
+  # Individual participant trajectories (transparent)
+  geom_line(aes(y = walks_outcome, group = id, color = type),
+            alpha = 0.25, linewidth = 0.5, na.rm = TRUE) +
+  geom_point(aes(y = walks_outcome, group = id, color = type),
+             alpha = 0.25, size = 0.5, na.rm = TRUE) +
+  # Mean trajectories (bold)
+  stat_summary(aes(y = walks_outcome, group = type, color = type),
+               fun = mean, geom = "line", linewidth = 1.5, na.rm = TRUE) +
+  stat_summary(aes(y = walks_outcome, group = type, color = type),
+               fun = mean, geom = "point", size = 3, na.rm = TRUE) +
+  # Reference line at 5 walks
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black", linewidth = 0.8) +
+  # Colors
+  scale_color_manual(
+    values = c("Control" = "#40B0A6", "Intervention" = "#D55E00"),
+    labels = c("Control (Total Walks)", "Intervention (Planned Walks)")
+  ) +
+  # Axes
+  scale_x_continuous(breaks = 1:12) +
+  scale_y_continuous(breaks = seq(0, 10, by = 1)) +
+  # Labels
+  labs(
+    title = "Planned Walks (Intervention) vs Total Walks (Control) Over Time",
+    subtitle = "Individual trajectories (transparent) and group means (bold)",
+    x = "Week",
+    y = "Number of Walks",
+    color = "Group"
+  ) +
+  # Theme
+  theme_minimal(base_size = 14, base_family = "Times New Roman") +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.key.size = unit(0.5, "cm"),
+    legend.text = element_text(size = 10),
+    legend.title = element_text(size = 12),
+    plot.margin = margin(t = 15, r = 15, b = 15, l = 10)
+  )
+```
+
+### Model 1 and 2 combined plot for model output - used in paper
+
+```{r}
+# Get EMMs from both models
+emm_total <- emmeans(glmodel1_adj, ~ type | week,
+                     at = list(week = 1:12),
+                     type = "response") %>%
+  as.data.frame() %>%
+  mutate(walk_type = "Total")
+
+emm_planned <- emmeans(glmodel2_adj, ~ type | week,
+                       at = list(week = 1:12),
+                       type = "response") %>%
+  as.data.frame() %>%
+  mutate(walk_type = "Planned")
+
+# Combine but filter intervention planned
+plot_data <- bind_rows(
+  emm_total %>% filter(type == "Control"),  # Control total only
+  emm_total %>% filter(type == "Intervention"),  # Intervention total
+  emm_planned %>% filter(type == "Intervention")  # Intervention planned
+) %>%
+  mutate(
+    group_label = case_when(
+      type == "Control" ~ "Control (Total)",
+      type == "Intervention" & walk_type == "Total" ~ "Intervention (Total)",
+      type == "Intervention" & walk_type == "Planned" ~ "Intervention (Planned)"
+    )
+  )
+
+# Create significance markers
+sig_data <- data.frame(
+  week = c(1, 6, 12),
+  rate = c(
+    max(plot_data$asymp.UCL[plot_data$week == 1]) + 0.5,
+    max(plot_data$asymp.UCL[plot_data$week == 6]) + 0.5,
+    max(plot_data$asymp.UCL[plot_data$week == 12]) + 0.5
+  ),
+  label = c("***", "***", "***")
+)
+
+
+# Plot
+ggplot(plot_data, aes(x = week, y = rate, color = group_label, group = group_label)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = asymp.LCL, ymax = asymp.UCL, fill = group_label),
+              alpha = 0.2, color = NA) +
+ geom_text(data = sig_data, aes(x = week, y = rate, label = label),
+            color = "black", size = 6, inherit.aes = FALSE) +
+  labs(
+    x = "Week",
+    y = "Estimated Weekly Walks",
+    color = "Group",
+    fill = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom") +
+  scale_x_continuous(breaks = 1:12) +
+  scale_y_continuous(breaks = 0:9) +
+  scale_color_manual(values = c(
+    "Control (Total)" = "#A8DCD1",
+    "Intervention (Total)" = "#FFBE6A",
+    "Intervention (Planned)" = "#D55E00"
+  )) +
+  scale_fill_manual(values = c(
+    "Control (Total)" = "#A8DCD1",
+    "Intervention (Total)" = "#FFBE6A",
+    "Intervention (Planned)" = "#D55E00"
+  ))
+```
+
+### Model 2: Bar plot with individual data points for each week
+
+```{r}
+# Bar plot with individual data points for each week planned vs total
+df_long_model2 %>%
+  ggplot(aes(x = factor(week), y = walks_outcome, fill = type)) +
+  # Bar for means
+  stat_summary(fun = mean, geom = "bar", alpha = 0.7,
+               position = position_dodge(width = 0.9), color = "black") +
+  # Individual data points
+  geom_point(aes(color = type),
+             position = position_jitterdodge(jitter.width = 0.2,
+                                             dodge.width = 0.9),
+             alpha = 0.6, size = 2) +
+  # Error bars (SE)
+  stat_summary(fun.data = mean_se, geom = "errorbar",
+               position = position_dodge(width = 0.9),
+               width = 0.2, linewidth = 0.8) +
+  # Reference line at 5 walks
+  geom_hline(yintercept = 5, linetype = "dashed",
+             color = "black", linewidth = 0.8) +
+  # Colors
+  scale_fill_manual(
+    values = c("Control" = "#FFBE6A", "Intervention" = "#40B0A6"),
+    labels = c("Control (Total Walks)", "Intervention (Planned Walks)")
+  ) +
+  scale_color_manual(
+    values = c("Control" = "#FFBE6AC0", "Intervention" = "#40B0A640"),
+    labels = c("Control (Total Walks)", "Intervention (Planned Walks)")
+  ) +
+  # Axes
+  scale_y_continuous(breaks = seq(0, 10, by = 1)) +
+  labs(
+    title = "Planned (Intervention) vs Total Walks (Control)",
+    x = "Week",
+    y = "Number of Walks",
+    fill = "Group",
+    color = "Group"
+  ) +
+  # Theme
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+```
+
+### Combined plot for both planned and unplanned - used in paper
+
+```{r}
+# --- Summarise means ---
+
+df_int_summary <- weekly_walks %>%
+  filter(type == "Intervention") %>%
+  group_by(week) %>%
+  summarise(
+    planned_mean = mean(weekly_planned_walks, na.rm = TRUE),
+    unplanned_mean = mean(weekly_unplanned_walks, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_ctrl_summary <- weekly_walks %>%
+  filter(type == "Control") %>%
+  group_by(week) %>%
+  summarise(
+    total_mean = mean(weekly_walks, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Build bar segments manually for proper stacking ---
+bar_width <- 0.4
+
+df_rects <- bind_rows(
+  # Control bar
+  df_ctrl_summary %>%
+    mutate(
+      xmin = as.numeric(factor(week)) - 0.225 - bar_width/2,
+      xmax = as.numeric(factor(week)) - 0.225 + bar_width/2,
+      ymin = 0,
+      ymax = total_mean,
+      fill_group = "Control (Total Walks)"
+    ),
+  # Intervention: planned (bottom)
+  df_int_summary %>%
+    mutate(
+      xmin = as.numeric(factor(week)) + 0.225 - bar_width/2,
+      xmax = as.numeric(factor(week)) + 0.225 + bar_width/2,
+      ymin = 0,
+      ymax = planned_mean,
+      fill_group = "Intervention (Planned)"
+    ),
+  # Intervention: unplanned (top, stacked on planned)
+  df_int_summary %>%
+    mutate(
+      xmin = as.numeric(factor(week)) + 0.225 - bar_width/2,
+      xmax = as.numeric(factor(week)) + 0.225 + bar_width/2,
+      ymin = planned_mean,
+      ymax = planned_mean + unplanned_mean,
+      fill_group = "Intervention (Unplanned)"
+    )
+)
+
+df_rects$fill_group <- factor(df_rects$fill_group,
+                              levels = c("Control (Total Walks)",
+                                         "Intervention (Planned)",
+                                         "Intervention (Unplanned)"))
+
+# --- Individual dots ---
+
+df_dots <- weekly_walks %>%
+  mutate(
+    bar_group = type,
+    total = if_else(type == "Intervention",
+                    weekly_planned_walks + weekly_unplanned_walks,
+                    weekly_walks)
+  )
+df_dots$bar_group <- factor(df_dots$bar_group,
+                            levels = c("Control", "Intervention"))
+
+# --- Plot ---
+
+ggplot() +
+  geom_rect(data = df_rects,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
+                fill = fill_group),
+            color = "black", alpha = 0.85) +
+  geom_point(data = df_dots,
+             aes(x = factor(week), y = total,
+                 colour = bar_group, fill = bar_group),
+             position = position_jitterdodge(jitter.width = 0.15,
+                                             dodge.width = 0.9),
+             alpha = 0.5, size = 2, show.legend = FALSE) +
+  geom_hline(yintercept = 5, linetype = "dashed",
+             color = "black", linewidth = 0.8) +
+  scale_fill_manual(
+    name = "",
+    values = c(
+      "Control (Total Walks)"    = "#A8DCD1",
+      "Intervention (Planned)"   = "#D55E00",
+      "Intervention (Unplanned)" = "#FFBE6A",
+      "Control"                  = "#A8DCD1",
+      "Intervention"             = "#FFBE6A"
+    ),
+    breaks = c("Control (Total Walks)",
+               "Intervention (Planned)",
+               "Intervention (Unplanned)")
+  ) +
+  scale_colour_manual(
+    values = c("Control" = "#A8DCD1C0", "Intervention" = "#EA8E35"),
+    guide = "none"
+  ) +
+  scale_x_discrete() +
+  scale_y_continuous(breaks = seq(0, 20, by = 2)) +
+  labs(
+    title = "Weekly Walks",
+    subtitle = "Bar height = mean total walks; dots = individual participant totals",
+    x = "Week",
+    y = "Number of Walks"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+```
+
+### Model 2: Bar plot with individual data points for timepoint 1,6,and 12
+
+```{r}
+# Filter to weeks 1, 6, and 12
+df_subset <- df_long_model2 %>%
+  filter(week %in% c(1, 6, 12))
+
+df_subset %>%
+  ggplot(aes(x = factor(week), y = walks_outcome, fill = type)) +
+  stat_summary(fun = mean, geom = "bar", alpha = 0.7,
+               position = position_dodge(width = 0.9),
+               color = "black", linewidth = 0.5) +
+  stat_summary(fun.data = mean_se, geom = "errorbar",
+               position = position_dodge(width = 0.9),
+               width = 0.25, linewidth = 0.8) +
+  geom_point(aes(color = type),
+             position = position_jitterdodge(jitter.width = 0.15,
+                                             dodge.width = 0.9),
+             alpha = 0.6, size = 2.5) +
+  geom_hline(yintercept = 5, linetype = "dashed",
+             color = "gray40", linewidth = 0.8) +
+  scale_fill_manual(
+    values = c("Control" = "#FFBE6A", "Intervention" = "#40B0A6"),
+    labels = c("Control (Total)", "Intervention (Planned)")
+  ) +
+  scale_color_manual(
+    values = c("Control" = "#1e40af", "Intervention" = "#991b1b"),
+    labels = c("Control (Total)", "Intervention (Planned)")
+  ) +
+  scale_y_continuous(breaks = seq(0, 10, by = 1), limits = c(0, 10)) +
+  scale_x_discrete(labels = c("Week 1", "Week 6", "Week 12")) +
+  labs(
+    title = "Walking Activity: Control vs Intervention",
+    x = "Time Point",
+    y = "Number of Walks",
+    fill = "Group",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Model 3: Total Duration of Walks - Adjusted Model
+
+```{r}
+# remove outlier
+weekly_walks_out <- weekly_walks %>%
+  filter(total_duration_walks > quantile(total_duration_walks, 0.25) - 1.5 * IQR(total_duration_walks) &
+         total_duration_walks < quantile(total_duration_walks, 0.75) + 1.5 * IQR(total_duration_walks))
+
+# Adjusted Model (race excluded due to limited sample diversity)
+model3_adj <- lmer(total_duration_walks ~ type * week + age2 + sex_cat +
+                   years_of_ed + days_since_injury_scaled + (1 | id),
+                   data = weekly_walks_out,
+                   REML = TRUE)
+
+summary(model3_adj)
+
+# Note: Random intercept only (1 | id) used due to convergence issues with random slope specification (1 + week | id)
+
+# Extract coefficients with CIs
+tidy(model3_adj, effects = "fixed", conf.int = TRUE)
+```
+
+### Model 3: Marginal means
+
+```{r}
+# Estimated marginal means from adjusted model
+emm3_adj <- emmeans(model3_adj, ~ type | week, at = list(week = c(1, 6, 12)), type = "response")
+print(emm3_adj)
+
+# Pairwise comparisons: Intervention vs Control at each week
+pairs(emm3_adj, by = "week")
+
+# Extract EMMs
+emm_table3 <- emm3_adj %>%
+  as.data.frame() %>%
+  select(week, type, emmean) %>%
+  pivot_wider(names_from = type, values_from = emmean) %>%
+  mutate(
+    Difference = Intervention / Control,
+    Diff_Label = paste0(round(Difference, 1), "× more")
+  )
+
+print(emm_table3)
+
+emm_table3_with_p <- emm_table3 %>%
+  mutate(`P-value` = c("<0.001", "<0.001", "<0.001"))
+
+# Create kable table
+table_kable <- emm_table3_with_p %>%
+  kbl(caption = "Estimated Marginal Means of Weekly Walk Duration",
+      booktabs = TRUE,
+      align = "c",
+      digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position"),
+                full_width = FALSE)
+
+table_kable
+```
+
+### Model 3: Visualization
+
+```{r}
+weekly_walks_out %>%
+  group_by(type, week) %>%
+  summarise(
+    mean_duration = mean(total_duration_walks, na.rm = TRUE),
+    se_duration = sd(total_duration_walks, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = week, y = mean_duration, color = type, group = type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_duration - se_duration,
+                    ymax = mean_duration + se_duration),
+                width = 0.3) +
+  scale_color_manual(values = c("Control" = "#40B0A6",
+                                 "Intervention" = "#D55E00")) +
+  labs(
+    title = "Walking Duration Over Time",
+    x = "Week",
+    y = "Duration (minutes, Mean ± SE)",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  scale_x_continuous(breaks = 1:12)
+
+# violin plot
+
+weekly_walks_out %>%
+  ggplot(aes(x = as.factor(week), y = total_duration_walks, fill = type)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", size = 2,
+               color = "black", position = position_dodge(0.9)) +
+  stat_summary(fun.data = mean_se, geom = "errorbar",
+               width = 0.2, color = "black",
+               position = position_dodge(0.9)) +
+  scale_fill_manual(values = c("Control" = "#40B0A6",
+                                "Intervention" = "#D55E00")) +
+  labs(
+    title = "Walking Duration Over Time",
+    x = "Week",
+    y = "Duration (minutes)",
+    fill = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# ridge plot
+library(ggridges)
+
+weekly_walks_out %>%
+  ggplot(aes(x = total_duration_walks, y = as.factor(week), fill = type, weight = weekly_walks)) +
+  geom_density_ridges(alpha = 0.7, scale = 0.9) +
+  scale_fill_manual(values = c("Control" = "#40B0A6",
+                                "Intervention" = "#D55E00")) +
+scale_y_discrete(limits = rev) +
+  labs(
+    title = "Walking Duration Over Time",
+    x = "Duration (minutes)",
+    y = "Week",
+    fill = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# ribbon plot — used in paper
+p_means <- df_means %>%
+  ggplot(aes(week, duration_mean, colour = group, fill = group)) +
+  geom_ribbon(aes(ymin = duration_mean - duration_se,
+                  ymax = duration_mean + duration_se), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.4) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Control" = "#A8DCD1", "Intervention" = "#FFBE6A")) +
+  scale_fill_manual(values = c("Control" = "#A8DCD1", "Intervention" = "#FFBE6A")) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(x = "Week", y = "Duration (mins)", colour = NULL, fill = NULL) +
+  annotate("text", x = c(1, 6, 12), y = Inf, label = "***", vjust = 1.5, size = 5) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+p_means
+```
+
+**MODEL 3 SUMMARY: Total Walking Duration**
+
+**Main Finding:**
+
+Intervention group walks 331 more minutes per week than Control (95% CI: -11 to 673 minutes), approximately 5-6 extra hours per week. This exceeds WHO's recommended 150 minutes of moderate activity by more than double. The wide confidence interval reflects substantial individual variability in walking duration.
+
+### Model 4: Steps in Walks - Adjusted Model
+
+```{r}
+# remove outlier (applied on top of Model 3 outlier-filtered dataset)
+weekly_walks_out <- weekly_walks_out %>%
+  filter(total_steps_in_walks > quantile(total_steps_in_walks, 0.25) - 1.5 * IQR(total_steps_in_walks) &
+         total_steps_in_walks < quantile(total_steps_in_walks, 0.75) + 1.5 * IQR(total_steps_in_walks))
+
+# Adjusted model
+model4_adj <- lmer(total_steps_in_walks ~ type * week + age2 + sex_cat +
+                   years_of_ed + days_since_injury_scaled + (1 | id),
+                   data = weekly_walks_out,
+                   REML = TRUE)
+summary(model4_adj)
+
+# Extract coefficients with CIs
+library(broom.mixed)
+tidy(model4_adj, effects = "fixed", conf.int = TRUE)
+```
+
+### Model 4: Marginal means
+
+```{r}
+# Estimated marginal means from adjusted model
+emm4_adj <- emmeans(model4_adj, ~ type | week, at = list(week = c(1, 6, 12)), type = "response")
+print(emm4_adj)
+
+# Pairwise comparisons: Intervention vs Control at each week
+pairs(emm4_adj, by = "week")
+
+# Extract EMMs
+emm_table4 <- emm4_adj %>%
+  as.data.frame() %>%
+  select(week, type, emmean) %>%
+  pivot_wider(names_from = type, values_from = emmean) %>%
+  mutate(
+    Difference = Intervention / Control,
+    Diff_Label = paste0(round(Difference, 1), "× more")
+  )
+
+print(emm_table4)
+
+emm_table4_with_p <- emm_table4 %>%
+  mutate(`P-value` = c("<0.001", "<0.001", "<0.001"))
+
+# Create kable table
+table_kable <- emm_table4_with_p %>%
+  kbl(caption = "Estimated Marginal Means of Weekly step count during walks",
+      booktabs = TRUE,
+      align = "c",
+      digits = 2) %>%
+  kable_styling(latex_options = c("striped", "hold_position"),
+                full_width = FALSE)
+
+table_kable
+```
+
+### Model 4: Visualization
+
+```{r}
+weekly_walks_out %>%
+  group_by(type, week) %>%
+  summarise(
+    mean_steps = mean(total_steps_in_walks, na.rm = TRUE),
+    se_steps = sd(total_steps_in_walks, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = week, y = mean_steps, color = type, group = type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_steps - se_steps,
+                    ymax = mean_steps + se_steps),
+                width = 0.3) +
+  scale_color_manual(values = c("Control" = "#40B0A6",
+                                 "Intervention" = "#D55E00")) +
+  labs(
+    title = "Steps in Walks Over Time",
+    x = "Week",
+    y = "Steps (Mean ± SE)",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  scale_x_continuous(breaks = 1:12)
+
+# ribbon plot — used in paper
+p_means_step <- df_means %>%
+  ggplot(aes(week, total_steps_in_walks_mean, colour = group, fill = group)) +
+  geom_ribbon(aes(ymin = total_steps_in_walks_mean - total_steps_in_walks_se,
+                  ymax = total_steps_in_walks_mean + total_steps_in_walks_se), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.4) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("Control" = "#A8DCD1", "Intervention" = "#FFBE6A")) +
+  scale_fill_manual(values = c("Control" = "#A8DCD1", "Intervention" = "#FFBE6A")) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(x = "Week", y = "Step Count", colour = NULL, fill = NULL) +
+  annotate("text", x = c(1, 6, 12), y = Inf, label = "***", vjust = 1.5, size = 5) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+p_means_step
+```
+
+**MODEL 4 SUMMARY: Steps in Walks - Weeks 1-12**
+
+**Main Finding:**
+
+Intervention group accumulates 8,962 more steps per week in walks than Control (95% CI: -4,414 to 22,337 steps). The wide confidence interval reflects substantial individual variability in walking patterns.
+
+```{r}
+# trying a single plot for duraiton and steps
+
+ggplot(weekly_walks_out, aes(x = week, y = total_duration_walks, size = total_steps_in_walks, color = type)) +
+  geom_point(alpha = 0.6) +
+  labs(x = "Week", y = "Total Duration (min)", size = "Total Steps",
+       title = "Weekly Activity: Duration and Steps")
+```

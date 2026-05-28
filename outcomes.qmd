@@ -1,0 +1,819 @@
+---
+title: "Roybal - Outcomes"
+format: html
+---
+
+# Roybal Final Data Analysis — Outcomes
+
+**Purpose:** This document covers exploratory outcome analyses of cogntive outcomes from the Roybal pilot RCT.
+
+### Load data
+
+```{r}
+library(emmeans)
+library(dplyr)
+
+# Loads: completed, dropped, all, weekly_walks, all_walks, weather_raw
+load("roybal_base.RData")
+
+# Composite variables built from columns already in completed (masterdoc sheet 1)
+# Verbal Fluency
+completed$baseline_vf_total <- completed$verbal_fluency_f + completed$verbal_fluency_a +
+                                completed$verbal_fluency_s + completed$verbal_fluency_animals
+completed$endpoint_vf_total <- completed$verbal_fluency_c + completed$verbal_fluency_f2 +
+                                completed$verbal_fluency_l + completed$verbal_fluency_fruits
+
+# HVLT
+completed$hvlt_baseline_total_recall   <- completed$hvlt_baseline_trial1 + completed$hvlt_baseline_trial2 + completed$hvlt_baseline_trial3
+completed$hvlt_baseline_delayed_recall <- completed$hvlt_baseline_trial4
+completed$hvlt_baseline_retention      <- (completed$hvlt_baseline_trial4 / completed$hvlt_baseline_trial3) * 100
+completed$hvlt_baseline_rdi            <- completed$discriminationindexdelay_form1
+
+completed$hvlt_endpoint_total_recall   <- completed$hvlt_endpoint_trial1 + completed$hvlt_endpoint_trial2 + completed$hvlt_endpoint_trial3
+completed$hvlt_endpoint_delayed_recall <- completed$hvlt_endpoint_trial4
+completed$hvlt_endpoint_retention      <- (completed$hvlt_endpoint_trial4 / completed$hvlt_endpoint_trial3) * 100
+completed$hvlt_endpoint_rdi            <- completed$discrimination_indexdelay_form2
+```
+
+### Group generation
+
+- This creates a variable called group_who that dichotomies participants into whether on average (for at least 6 of 12 weeks) walked for 150 minutes or more
+
+```{r}
+# create variable that groups participants by whether ot not they walked for 150s on average for at least 6 of the 12 weeks. 
+completed <- weekly_walks %>%
+  group_by(id) %>%
+  summarise(group_who = as.integer(sum(total_duration_walks > 150) >= 6)) %>%
+  left_join(completed, ., by = "id")
+
+# ---- Stacked proportion plot: group_who by study condition ----
+completed %>%
+  filter(!is.na(group_who), !is.na(group)) %>%
+  mutate(
+    group_who_label = factor(group_who, levels = c(0, 1),
+                             labels = c("Did Not Meet", "Met Threshold"))
+  ) %>%
+  count(group_who_label, group) %>%
+  group_by(group_who_label) %>%
+  mutate(prop = n / sum(n),
+         label = paste0(round(prop * 100), "%")) %>%
+  ungroup() %>%
+  ggplot(aes(x = group_who_label, y = n, fill = group)) +
+  geom_col(position = "stack") +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5),
+            size = 4, color = "black") +
+  scale_fill_manual(values = c("Control" = "#40B0A6", "Intervention" = "#FFBE6A")) +
+  scale_y_continuous(breaks = scales::pretty_breaks()) +
+  labs(
+    title = "150 mins of walking per week",
+    x     = "Walking Threshold Group",
+    y     = "Number of Participants",
+    fill  = "Condition"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+### Adherence depth: how many weeks above 150 min?
+
+```{r}
+library(forcats)
+library(kableExtra)
+
+# per-participant: total weeks > 150, derived group_who, additional weeks beyond threshold
+adherence_summary <- weekly_walks %>%
+  filter(week <= 12) %>%
+  group_by(id) %>%
+  summarise(
+    n_weeks_above = sum(total_duration_walks > 150, na.rm = TRUE),
+    .groups       = "drop"
+  ) %>%
+  mutate(
+    group_who        = as.integer(n_weeks_above >= 6),
+    additional_weeks = if_else(group_who == 1L, n_weeks_above - 6L, NA_integer_)
+  )
+
+# join back to week-level data
+weekly_above <- weekly_walks %>%
+  filter(week <= 12) %>%
+  mutate(above_150 = total_duration_walks > 150) %>%
+  left_join(adherence_summary, by = "id")
+
+# ── Plot 1: tile heatmap — participant × week ─────────────────────────────────
+weekly_above %>%
+  mutate(
+    id_sorted   = fct_reorder(id, n_weeks_above, .desc = TRUE),
+    group_label = factor(group_who, levels = c(1, 0),
+                         labels = c("Met threshold (≥6 wks)", "Did not meet (<6 wks)"))
+  ) %>%
+  ggplot(aes(x = week, y = id_sorted, fill = above_150)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_vline(xintercept = 6.5, linetype = "dashed", color = "black", linewidth = 0.7) +
+  facet_grid(group_label ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_manual(
+    values   = c("TRUE" = "#2196F3", "FALSE" = "#E0E0E0"),
+    labels   = c("TRUE" = "> 150 min", "FALSE" = "≤ 150 min"),
+    na.value = "grey90"
+  ) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    title    = "Weekly walking duration > 150 min — by participant and week",
+    subtitle = "Dashed line at week 6 (minimum threshold); sorted by total weeks above threshold",
+    x        = "Week",
+    y        = "Participant",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y     = element_text(size = 7),
+    strip.text.y    = element_text(angle = 0, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# ── Plot 2: distribution of total weeks > 150 among group 1 ──────────────────
+adherence_summary %>%
+  filter(group_who == 1) %>%
+  count(n_weeks_above) %>%
+  ggplot(aes(x = factor(n_weeks_above), y = n)) +
+  geom_col(fill = "#2196F3", width = 0.6) +
+  geom_text(aes(label = n), vjust = -0.4, size = 4.5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Group 1: distribution of total weeks with > 150 min walking",
+    subtitle = "Threshold = 6 weeks; x-axis shows total weeks achieved",
+    x        = "Total weeks with > 150 min",
+    y        = "Number of participants"
+  ) +
+  theme_minimal(base_size = 13)
+
+# ── Table: group 1 — total and additional weeks beyond threshold ──────────────
+adherence_summary %>%
+  filter(group_who == 1) %>%
+  arrange(desc(n_weeks_above)) %>%
+  select(id, n_weeks_above, additional_weeks) %>%
+  rename(
+    Participant        = id,
+    `Total weeks >150` = n_weeks_above,
+    `Additional weeks` = additional_weeks
+  ) %>%
+  kbl(
+    caption  = "Group 1 participants: total and additional weeks with > 150 min walking",
+    booktabs = TRUE,
+    align    = "lcc"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+### PROMIS
+
+##### Cognitive health
+
+```{r}
+# PROMIS Cognitive
+promis_cog_long <- completed %>%
+  select(id, group, group_who, age2, sex_cat, years_of_ed, days_since_injury, cog_func_tscore, cog_func_tscore_v2) %>%
+  pivot_longer(cols = c(cog_func_tscore, cog_func_tscore_v2), names_to = "timepoint", values_to = "score") %>%
+  mutate(timepoint_numeric = ifelse(timepoint == "cog_func_tscore", 0, 1))
+
+# Model
+m1_promis_cog <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = promis_cog_long)
+summary(m1_promis_cog)
+
+# Omnibus visual check (panel of all assumption plots) ---
+result <- check_model(m1_promis_cog)
+plot(result, panel = FALSE)
+check_outliers(m1_promis_cog)
+
+# Remove the single influential observation (row 71)
+model_data_clean <- promis_cog_long[-71, ]
+
+# Refit the model on the cleaned data
+model_clean <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = model_data_clean)
+summary(model_clean)
+
+# Compare influential-case-removed model to original
+compare_performance(m1_promis_cog, model_clean)
+
+# Recheck outliers to confirm resolved
+check_outliers(model_clean)
+
+# Remove the single influential observation (row 71)
+model_data_clean_2 <- promis_cog_long[-70, ]
+
+# Refit the model on the cleaned data
+model_clean_2 <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = model_data_clean_2)
+summary(model_clean_2)
+
+# Compare influential-case-removed model to original
+compare_performance(m1_promis_cog, model_clean, model_clean_2)
+
+  # asusmptions check for final model
+result <- check_model(model_clean_2)
+plot(result, panel = FALSE)
+
+# standardized ES
+standardize_parameters(model_clean_2, method = "refit") %>%
+  filter(Parameter == "group_who:timepoint_numeric")
+
+means_df <- model_data_clean_2 %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  ) %>%
+  group_by(Group, TimePoint) %>%
+  summarise(
+    n    = n(),
+    Mean = mean(score, na.rm = TRUE),
+    SE   = sd(score, na.rm = TRUE) / sqrt(n),
+    .groups = "drop"
+  )
+
+individual_df <- model_data_clean_2 %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  )
+
+# Marginal means at pre/post for each group_who level
+emm <- emmeans(model_clean_2, ~ group_who * timepoint_numeric,
+               at = list(timepoint_numeric = c(0, 1)))
+emm
+
+# 1. group_who=1 vs group_who=0 AT POST-TEST (timepoint=1)
+contrast(emm, method = "revpairwise", by = "timepoint_numeric")
+
+# 2. Pre-to-post change WITHIN each group_who level (marginal effects)
+contrast(emm, method = "revpairwise", by = "group_who")
+
+# PLOT
+
+ggplot() +
+  # Individual trajectories
+  geom_line(data = individual_df,
+            aes(x = TimePoint, y = score, group = id, color = Group),
+            alpha = 0.15, position = position_dodge(width = 0.2)) +
+  geom_point(data = individual_df,
+             aes(x = TimePoint, y = score, group = id, color = Group),
+             alpha = 0.3, size = 2, position = position_dodge(width = 0.2)) +
+  # Group mean lines
+  geom_line(data = means_df,
+            aes(x = TimePoint, y = Mean, group = Group, color = Group),
+            linewidth = 1.5) +
+  geom_point(data = means_df,
+             aes(x = TimePoint, y = Mean, group = Group, color = Group),
+             size = 4) +
+  geom_errorbar(data = means_df,
+                aes(x = TimePoint, ymin = Mean - SE, ymax = Mean + SE, group = Group, color = Group),
+                width = 0.1, linewidth = 1) +
+  scale_color_manual(values = c("Did Not Meet" = "#40B0A6", "Met Threshold" = "#FFBE6A")) +
+  labs(
+    title    = "Cognitive Function T-Score (Higher scores are better)",
+    subtitle = "Pre-Post Changes by Walking Threshold Group",
+    x        = "Assessment Time",
+    y        = "Score",
+    color    = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle   = element_text(hjust = 0.5)
+  )
+```
+
+##### Physical health
+
+```{r}
+# PROMIS Physical Health
+promis_phys_long <- completed %>%
+  select(id, group, group_who, age2, sex_cat, years_of_ed, days_since_injury, gph_tscore, gph_tscore_v2) %>%
+  pivot_longer(cols = c(gph_tscore, gph_tscore_v2), names_to = "timepoint", values_to = "score") %>%
+  mutate(timepoint_numeric = ifelse(timepoint == "gph_tscore", 0, 1))
+
+# model 
+m1_promis_phys <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = promis_phys_long)
+summary(m1_promis_phys)
+
+# Recheck outliers to confirm resolved
+check_outliers(m1_promis_phys)
+
+# standardized ES
+standardize_parameters(m1_promis_phys, method = "refit") %>%
+  filter(Parameter == "group_who:timepoint_numeric")
+```
+
+##### Mental Health
+
+```{r}
+# PROMIS Mental Health
+promis_mental_long <- completed %>%
+  select(id, group, age2, group_who, sex_cat, years_of_ed, days_since_injury, gmh_tscore, gmh_tscore_v2) %>%
+  pivot_longer(cols = c(gmh_tscore, gmh_tscore_v2), names_to = "timepoint", values_to = "score") %>%
+  mutate(timepoint_numeric = ifelse(timepoint == "gmh_tscore", 0, 1))
+
+# model 
+m1_promis_men <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = promis_phys_long)
+summary(m1_promis_men)
+
+# Recheck outliers to confirm resolved
+check_outliers(m1_promis_men)
+
+# standardized ES
+standardize_parameters(m1_promis_men, method = "refit") %>%
+  filter(Parameter == "group_who:timepoint_numeric")
+```
+
+##### FDR corrections
+
+```{r}
+  # FDR corrections 
+   FDR correction on interaction term p-values
+interaction_pvals <- c(
+  m1_promis_men   = coef(summary(m1_promis_men))["group_who.x:timepoint_numeric", "Pr(>|t|)"],
+  m1_promis_phys  = coef(summary(m1_promis_phys))["group_who.x:timepoint_numeric", "Pr(>|t|)"],
+  model_clean_2   = coef(summary(model_clean_2))["group_who.x:timepoint_numeric", "Pr(>|t|)"]
+)
+
+fdr_adjusted <- p.adjust(interaction_pvals, method = "fdr")
+
+data.frame(
+  model       = names(interaction_pvals),
+  p_raw       = interaction_pvals,
+  p_fdr       = fdr_adjusted,
+  sig_fdr     = fdr_adjusted < 0.05
+)
+```
+
+### Cognition
+
+##### prepare data
+
+```{r}
+# Prepare long format data including group_who.x
+vf_long_who <- completed %>%
+  select(id, group, group_who, age2, sex_cat, years_of_ed, days_since_injury, baseline_vf_total, endpoint_vf_total) %>%
+  pivot_longer(cols = c(baseline_vf_total, endpoint_vf_total), names_to = "timepoint", values_to = "score") %>%
+  mutate(timepoint_numeric = ifelse(timepoint == "baseline_vf_total", 0, 1))
+
+hvlt_total_long_who <- completed %>%
+  select(id, group, group_who, age2, sex_cat, years_of_ed, days_since_injury, hvlt_baseline_total_recall, hvlt_endpoint_total_recall) %>%
+  pivot_longer(cols = c(hvlt_baseline_total_recall, hvlt_endpoint_total_recall), names_to = "timepoint", values_to = "score") %>%
+  mutate(timepoint_numeric = ifelse(timepoint == "hvlt_baseline_total_recall", 0, 1))
+
+hvlt_delayed_long_who <- completed %>%
+  select(id, group, group_who, age2, sex_cat, years_of_ed, days_since_injury, hvlt_baseline_delayed_recall, hvlt_endpoint_delayed_recall) %>%
+  pivot_longer(cols = c(hvlt_baseline_delayed_recall, hvlt_endpoint_delayed_recall), names_to = "timepoint", values_to = "score") %>%
+  mutate(timepoint_numeric = ifelse(timepoint == "hvlt_baseline_delayed_recall", 0, 1))
+
+hvlt_retention_long_who <- completed %>%
+  select(id, group, group_who, age2, sex_cat, years_of_ed, days_since_injury, hvlt_baseline_retention, hvlt_endpoint_retention) %>%
+  pivot_longer(cols = c(hvlt_baseline_retention, hvlt_endpoint_retention), names_to = "timepoint", values_to = "score") %>%
+  mutate(timepoint_numeric = ifelse(timepoint == "hvlt_baseline_retention", 0, 1))
+
+```
+
+##### Verbal fluency
+
+```{r}
+
+# Verbal Fluency
+m1_vf_who <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = vf_long_who)
+summary(m1_vf_who)
+check_outliers(m1_vf_who)
+
+# standardized ES
+standardize_parameters(m1_vf_who, method = "refit") %>%
+  filter(Parameter == "group_who:timepoint_numeric")
+
+means_df_vf <- vf_long_who %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  ) %>%
+  group_by(Group, TimePoint) %>%
+  summarise(n = n(), Mean = mean(score, na.rm = TRUE), SE = sd(score, na.rm = TRUE) / sqrt(n), .groups = "drop")
+
+individual_df_vf <- vf_long_who %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  )
+
+ggplot() +
+  geom_line(data = individual_df_vf,
+            aes(x = TimePoint, y = score, group = id, color = Group),
+            alpha = 0.15, position = position_dodge(width = 0.2)) +
+  geom_point(data = individual_df_vf,
+             aes(x = TimePoint, y = score, group = id, color = Group),
+             alpha = 0.3, size = 2, position = position_dodge(width = 0.2)) +
+  geom_line(data = means_df_vf,
+            aes(x = TimePoint, y = Mean, group = Group, color = Group),
+            linewidth = 1.5) +
+  geom_point(data = means_df_vf,
+             aes(x = TimePoint, y = Mean, group = Group, color = Group),
+             size = 4) +
+  geom_errorbar(data = means_df_vf,
+                aes(x = TimePoint, ymin = Mean - SE, ymax = Mean + SE, group = Group, color = Group),
+                width = 0.1, linewidth = 1) +
+  scale_color_manual(values = c("Did Not Meet" = "#40B0A6", "Met Threshold" = "#FFBE6A")) +
+  labs(
+    title    = "Verbal Fluency (Higher scores are better)",
+    subtitle = "Pre-Post Changes by Walking Threshold Group",
+    x        = "Assessment Time",
+    y        = "Score",
+    color    = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+##### HVLT total recall
+
+```{r}
+# HVLT Total Recall
+m1_hvlt_total_who <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = hvlt_total_long_who)
+summary(m1_hvlt_total_who)
+check_outliers(m1_hvlt_total_who)
+
+# standardized ES
+standardize_parameters(m1_hvlt_total_who, method = "refit") %>%
+  filter(Parameter == "group_who:timepoint_numeric")
+
+means_df_hvlt_total <- hvlt_total_long_who %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  ) %>%
+  group_by(Group, TimePoint) %>%
+  summarise(n = n(), Mean = mean(score, na.rm = TRUE), SE = sd(score, na.rm = TRUE) / sqrt(n), .groups = "drop")
+
+individual_df_hvlt_total <- hvlt_total_long_who %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  )
+
+ggplot() +
+  geom_line(data = individual_df_hvlt_total,
+            aes(x = TimePoint, y = score, group = id, color = Group),
+            alpha = 0.15, position = position_dodge(width = 0.2)) +
+  geom_point(data = individual_df_hvlt_total,
+             aes(x = TimePoint, y = score, group = id, color = Group),
+             alpha = 0.3, size = 2, position = position_dodge(width = 0.2)) +
+  geom_line(data = means_df_hvlt_total,
+            aes(x = TimePoint, y = Mean, group = Group, color = Group),
+            linewidth = 1.5) +
+  geom_point(data = means_df_hvlt_total,
+             aes(x = TimePoint, y = Mean, group = Group, color = Group),
+             size = 4) +
+  geom_errorbar(data = means_df_hvlt_total,
+                aes(x = TimePoint, ymin = Mean - SE, ymax = Mean + SE, group = Group, color = Group),
+                width = 0.1, linewidth = 1) +
+  scale_color_manual(values = c("Did Not Meet" = "#40B0A6", "Met Threshold" = "#FFBE6A")) +
+  labs(
+    title    = "HVLT Total Recall (Higher scores are better)",
+    subtitle = "Pre-Post Changes by Walking Threshold Group",
+    x        = "Assessment Time",
+    y        = "Score",
+    color    = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+##### HVLT delayed recall
+
+```{r}
+
+# HVLT Delayed Recall - primary model
+m1_hvlt_delayed_who <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = hvlt_delayed_long_who)
+summary(m1_hvlt_delayed_who)
+
+# Detect outliers
+outliers_hvlt_delayed <- check_outliers(m1_hvlt_delayed_who)
+outliers_hvlt_delayed
+outlier_rows_hvlt_delayed <- which(outliers_hvlt_delayed)
+cat("Outlier rows:", outlier_rows_hvlt_delayed, "\n")
+
+# Remove outliers and refit
+hvlt_delayed_clean <- hvlt_delayed_long_who[-outlier_rows_hvlt_delayed, ]
+m1_hvlt_delayed_clean <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = hvlt_delayed_clean)
+summary(m1_hvlt_delayed_clean)
+
+# Compare original vs cleaned model
+compare_performance(m1_hvlt_delayed_who, m1_hvlt_delayed_clean)
+
+# Recheck outliers on cleaned model - second round
+outliers_hvlt_delayed_2 <- check_outliers(m1_hvlt_delayed_clean)
+outliers_hvlt_delayed_2
+outlier_rows_hvlt_delayed_2 <- which(outliers_hvlt_delayed_2)
+cat("Second-round outlier rows:", outlier_rows_hvlt_delayed_2, "\n")
+
+# Remove second outlier and refit
+hvlt_delayed_clean_2 <- hvlt_delayed_clean[-outlier_rows_hvlt_delayed_2, ]
+m1_hvlt_delayed_clean_2 <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = hvlt_delayed_clean_2)
+summary(m1_hvlt_delayed_clean_2)
+
+# Compare all three models
+compare_performance(m1_hvlt_delayed_who, m1_hvlt_delayed_clean, m1_hvlt_delayed_clean_2)
+
+# Recheck outliers - third round
+outliers_hvlt_delayed_3 <- check_outliers(m1_hvlt_delayed_clean_2)
+outliers_hvlt_delayed_3
+outlier_rows_hvlt_delayed_3 <- which(outliers_hvlt_delayed_3)
+cat("Third-round outlier rows:", outlier_rows_hvlt_delayed_3, "\n")
+
+# Remove third outlier and refit
+hvlt_delayed_clean_3 <- hvlt_delayed_clean_2[-outlier_rows_hvlt_delayed_3, ]
+m1_hvlt_delayed_clean_3 <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = hvlt_delayed_clean_3)
+summary(m1_hvlt_delayed_clean_3)
+
+# Compare all four models
+compare_performance(m1_hvlt_delayed_who, m1_hvlt_delayed_clean, m1_hvlt_delayed_clean_2, m1_hvlt_delayed_clean_3)
+
+# Recheck outliers to confirm resolved
+check_outliers(m1_hvlt_delayed_clean_3)
+
+# Assumptions check on final model
+result_delayed <- check_model(m1_hvlt_delayed_clean_3)
+plot(result_delayed, panel = FALSE)
+
+# standardized ES
+standardize_parameters(m1_hvlt_delayed_clean_3, method = "refit") %>%
+  filter(Parameter == "group_who:timepoint_numeric")
+
+means_df_hvlt_delayed <- hvlt_delayed_clean_3 %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  ) %>%
+  group_by(Group, TimePoint) %>%
+  summarise(n = n(), Mean = mean(score, na.rm = TRUE), SE = sd(score, na.rm = TRUE) / sqrt(n), .groups = "drop")
+
+individual_df_hvlt_delayed <- hvlt_delayed_clean_3 %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  )
+
+ggplot() +
+  geom_line(data = individual_df_hvlt_delayed,
+            aes(x = TimePoint, y = score, group = id, color = Group),
+            alpha = 0.15, position = position_dodge(width = 0.2)) +
+  geom_point(data = individual_df_hvlt_delayed,
+             aes(x = TimePoint, y = score, group = id, color = Group),
+             alpha = 0.3, size = 2, position = position_dodge(width = 0.2)) +
+  geom_line(data = means_df_hvlt_delayed,
+            aes(x = TimePoint, y = Mean, group = Group, color = Group),
+            linewidth = 1.5) +
+  geom_point(data = means_df_hvlt_delayed,
+             aes(x = TimePoint, y = Mean, group = Group, color = Group),
+             size = 4) +
+  geom_errorbar(data = means_df_hvlt_delayed,
+                aes(x = TimePoint, ymin = Mean - SE, ymax = Mean + SE, group = Group, color = Group),
+                width = 0.1, linewidth = 1) +
+  scale_color_manual(values = c("Did Not Meet" = "#40B0A6", "Met Threshold" = "#FFBE6A")) +
+  labs(
+    title    = "HVLT Delayed Recall (Higher scores are better)",
+    subtitle = "Pre-Post Changes by Walking Threshold Group",
+    x        = "Assessment Time",
+    y        = "Score",
+    color    = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+##### HVLT retention
+
+```{r}
+
+# HVLT Retention - primary model
+m1_hvlt_retention_who <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = hvlt_retention_long_who)
+summary(m1_hvlt_retention_who)
+
+# Detect outliers
+outliers_hvlt_retention <- check_outliers(m1_hvlt_retention_who)
+outliers_hvlt_retention
+outlier_rows_hvlt_retention <- which(outliers_hvlt_retention)
+cat("Outlier rows:", outlier_rows_hvlt_retention, "\n")
+
+# Remove outliers and refit
+hvlt_retention_clean <- hvlt_retention_long_who[-outlier_rows_hvlt_retention, ]
+m1_hvlt_retention_clean <- lmer(score ~ group_who + timepoint_numeric + group_who*timepoint_numeric + age2 + sex_cat + years_of_ed + days_since_injury + group + (1|id), data = hvlt_retention_clean)
+summary(m1_hvlt_retention_clean)
+
+# Compare original vs cleaned model
+compare_performance(m1_hvlt_retention_who, m1_hvlt_retention_clean)
+
+# Recheck outliers on cleaned model
+check_outliers(m1_hvlt_retention_clean)
+
+# Assumptions check on final model
+result_retention <- check_model(m1_hvlt_retention_clean)
+plot(result_retention, panel = FALSE)
+
+# standardized ES
+standardize_parameters(m1_hvlt_retention_clean, method = "refit") %>%
+  filter(Parameter == "group_who:timepoint_numeric")
+
+means_df_hvlt_retention <- hvlt_retention_clean %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  ) %>%
+  group_by(Group, TimePoint) %>%
+  summarise(n = n(), Mean = mean(score, na.rm = TRUE), SE = sd(score, na.rm = TRUE) / sqrt(n), .groups = "drop")
+
+individual_df_hvlt_retention <- hvlt_retention_clean %>%
+  filter(!is.na(score)) %>%
+  mutate(
+    TimePoint = factor(timepoint_numeric, levels = c(0, 1), labels = c("Pre", "Post")),
+    Group     = factor(group_who, levels = c(0, 1), labels = c("Did Not Meet", "Met Threshold"))
+  )
+
+ggplot() +
+  geom_line(data = individual_df_hvlt_retention,
+            aes(x = TimePoint, y = score, group = id, color = Group),
+            alpha = 0.15, position = position_dodge(width = 0.2)) +
+  geom_point(data = individual_df_hvlt_retention,
+             aes(x = TimePoint, y = score, group = id, color = Group),
+             alpha = 0.3, size = 2, position = position_dodge(width = 0.2)) +
+  geom_line(data = means_df_hvlt_retention,
+            aes(x = TimePoint, y = Mean, group = Group, color = Group),
+            linewidth = 1.5) +
+  geom_point(data = means_df_hvlt_retention,
+             aes(x = TimePoint, y = Mean, group = Group, color = Group),
+             size = 4) +
+  geom_errorbar(data = means_df_hvlt_retention,
+                aes(x = TimePoint, ymin = Mean - SE, ymax = Mean + SE, group = Group, color = Group),
+                width = 0.1, linewidth = 1) +
+  scale_color_manual(values = c("Did Not Meet" = "#40B0A6", "Met Threshold" = "#FFBE6A")) +
+  labs(
+    title    = "HVLT Retention (Higher scores are better)",
+    subtitle = "Pre-Post Changes by Walking Threshold Group",
+    x        = "Assessment Time",
+    y        = "Score",
+    color    = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+### Results Summary
+
+```{r}
+library(emmeans)
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+fmt_p <- function(p) {
+  if (p < .001) "< .001" else paste0("= .", sprintf("%03d", round(p * 1000)))
+}
+
+extract_stats <- function(label, model, int_term, group_var = "group_who") {
+
+  ct  <- coef(summary(model))
+  ci  <- confint(model, method = "Wald", parm = int_term)
+
+  b   <- ct[int_term, "Estimate"]
+  se  <- ct[int_term, "Std. Error"]
+  df  <- ct[int_term, "df"]
+  tv  <- ct[int_term, "t value"]
+  cil <- ci[int_term, "2.5 %"]
+  ciu <- ci[int_term, "97.5 %"]
+
+  int_line <- sprintf(
+    "  Interaction:      b = %.2f, SE = %.2f, t(%.2f) = %.2f, p %s, 95%% CI [%.2f, %.2f]",
+    b, se, df, tv, fmt_p(p), cil, ciu)
+
+  # within-group pre-to-post changes via emmeans
+  emm_form <- reformulate(paste0(group_var, " * timepoint_numeric"))
+  emm <- emmeans(model, emm_form, at = list(timepoint_numeric = c(0, 1)))
+  wc  <- summary(contrast(emm, method = "revpairwise", by = group_var), infer = c(TRUE, TRUE))
+
+  g0 <- wc[wc[[group_var]] == 0, ]
+  g1 <- wc[wc[[group_var]] == 1, ]
+
+  g0_line <- sprintf(
+    "  Did Not Meet (0): b = %.2f, SE = %.2f, t(%.2f) = %.2f, p %s, 95%% CI [%.2f, %.2f]",
+    g0$estimate, g0$SE, g0$df, g0$t.ratio, fmt_p(g0$p.value), g0$lower.CL, g0$upper.CL)
+
+  g1_line <- sprintf(
+    "  Met Threshold (1):b = %.2f, SE = %.2f, t(%.2f) = %.2f, p %s, 95%% CI [%.2f, %.2f]",
+    g1$estimate, g1$SE, g1$df, g1$t.ratio, fmt_p(g1$p.value), g1$lower.CL, g1$upper.CL)
+
+  cat(paste0("\n", label, "\n"))
+  cat(int_line, "\n")
+  cat(g0_line, "\n")
+  cat(g1_line, "\n")
+}
+
+# ── run for each model ───────────────────────────────────────────────────────
+
+extract_stats("PROMIS Cognitive Function",
+              model_clean_2,
+              int_term = "group_who:timepoint_numeric")
+
+extract_stats("PROMIS Physical Health",
+              m1_promis_phys,
+              int_term = "group_who:timepoint_numeric")
+
+extract_stats("PROMIS Mental Health",
+              m1_promis_men,
+              int_term = "group_who:timepoint_numeric")
+
+extract_stats("Verbal Fluency",
+              m1_vf_who,
+              int_term = "group_who:timepoint_numeric")
+
+extract_stats("HVLT Total Recall",
+              m1_hvlt_total_who,
+              int_term = "group_who:timepoint_numeric")
+
+extract_stats("HVLT Delayed Recall",
+              m1_hvlt_delayed_clean_3,
+              int_term = "group_who:timepoint_numeric")
+
+extract_stats("HVLT Retention",
+              m1_hvlt_retention_who,
+              int_term = "group_who:timepoint_numeric")
+```
+
+```{r}
+library(kableExtra)
+
+# ── helper: returns a single-row data frame instead of printing ───────────────
+extract_stats_df <- function(label, model, int_term, group_var = "group_who") {
+
+  ct  <- coef(summary(model))
+  ci  <- confint(model, method = "Wald", parm = int_term)
+
+  b   <- ct[int_term, "Estimate"]
+  se  <- ct[int_term, "Std. Error"]
+  df  <- ct[int_term, "df"]
+  tv  <- ct[int_term, "t value"]
+  cil <- ci[int_term, "2.5 %"]
+  ciu <- ci[int_term, "97.5 %"]
+
+  emm_form <- reformulate(paste0(group_var, " * timepoint_numeric"))
+  emm <- emmeans(model, emm_form, at = list(timepoint_numeric = c(0, 1)))
+  wc  <- summary(contrast(emm, method = "revpairwise", by = group_var), infer = c(TRUE, TRUE))
+
+  g0 <- wc[wc[[group_var]] == 0, ]
+  g1 <- wc[wc[[group_var]] == 1, ]
+
+  data.frame(
+    Outcome            = label,
+    `Int. b (SE)`      = sprintf("%.2f (%.2f)", b, se),
+    `t (df)`           = sprintf("%.2f (%.0f)", tv, df),
+    `95% CI`           = sprintf("[%.2f, %.2f]", cil, ciu),
+    `DNM b (SE)`       = sprintf("%.2f (%.2f)", g0$estimate, g0$SE),
+    `MET b (SE)`       = sprintf("%.2f (%.2f)", g1$estimate, g1$SE),
+    check.names        = FALSE,
+    stringsAsFactors   = FALSE
+  )
+}
+
+# ── build table ───────────────────────────────────────────────────────────────
+results_table <- bind_rows(
+  extract_stats_df("PROMIS Cognitive Function", model_clean_2,          "group_who:timepoint_numeric"),
+  extract_stats_df("PROMIS Physical Health",    m1_promis_phys,          "group_who:timepoint_numeric"),
+  extract_stats_df("PROMIS Mental Health",      m1_promis_men,           "group_who:timepoint_numeric"),
+  extract_stats_df("Verbal Fluency",            m1_vf_who,               "group_who:timepoint_numeric"),
+  extract_stats_df("HVLT Total Recall",         m1_hvlt_total_who,       "group_who:timepoint_numeric"),
+  extract_stats_df("HVLT Delayed Recall",       m1_hvlt_delayed_clean_3, "group_who:timepoint_numeric"),
+  extract_stats_df("HVLT Retention",            m1_hvlt_retention_who,   "group_who:timepoint_numeric")
+)
+
+# ── render ────────────────────────────────────────────────────────────────────
+results_table %>%
+  kbl(caption  = "Results Summary: Interaction and Within-Group Pre–Post Changes",
+      booktabs = TRUE,
+      align    = c("l", rep("c", 5))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 12) %>%
+  add_header_above(c(" " = 1,
+                     "Interaction (Group × Time)" = 3,
+                     "Did Not Meet (pre→post)" = 1,
+                     "Met Threshold (pre→post)" = 1)) %>%
+  column_spec(1, bold = TRUE, width = "14em")
+```

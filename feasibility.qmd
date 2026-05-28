@@ -1,0 +1,610 @@
+---
+title: "Roybal - Feasibility & Compliance"
+format:
+  html:
+    toc: true
+    embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_group: inline
+---
+
+# Roybal Final Data Analysis — Feasibility & Compliance
+
+**Purpose:** This document covers feasibility of intervention delivery and study procedures, and participant compliance outcomes from the Roybal pilot RCT.
+
+------------------------------------------------------------------------
+
+### Load libraries
+
+```{r}
+pkgs <- c(
+  "readr", "readxl", "skimr", "tidyverse", "lme4", "lmerTest",
+  "tidymodels", "performance", "emmeans", "pwr", "longpower", "simr",
+  "ggplot2", "consort", "kableExtra", "broom.mixed", "effectsize",
+  "car", "gridExtra", "ggstatsplot", "ggeffects", "tableone",
+  "ggpubr", "flextable", "officer"
+)
+
+install.packages(setdiff(pkgs, rownames(installed.packages())))
+
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+### Load data
+
+```{r}
+load("roybal_base.RData")
+
+# Fix weather id capitalisation and join weekly summary cols to weekly_walks
+weather_clean <- weather_raw %>%
+  mutate(id = gsub("^roybal", "Roybal", id))
+
+weekly_walks <- weekly_walks %>%
+  left_join(
+    weather_clean %>% select(id, week, avg_temp_f, avg_precip_in, pct_precip_days, total_precip_in),
+    by = c("id", "week")
+  )
+```
+
+## Feasibility
+
+### Consort Diagram
+
+```{r}
+library(consort)
+
+consort <- add_box(txt = "Inquired (n = 341)")
+
+consort <- add_side_box(consort,
+                  txt = "Excluded (n = 223)\n• Not meeting criteria (n = 62)\n• Lost to follow up (n = 159)\n• Declined to participate (n = 2)")
+
+consort <- add_box(consort, txt = "Pre-screened (n = 118)")
+
+consort <- add_side_box(consort,
+                  txt = "Excluded (n = 62)\n• Not meeting criteria (n = 32)\n• Lost to follow up (n = 27)\n• Declined to participate (n = 3)")
+
+consort <- add_box(consort, txt = "Randomized (n = 56)")
+
+consort <- add_split(consort,
+                     txt = c("Intervention (n = 28)",
+                            "Control (n = 28)"))
+
+consort <- add_side_box(consort,
+                  txt = c("Dropout (n = 5)",
+                          "Dropout (n = 3)"))
+
+consort <- add_box(consort,
+                   txt = c("Intervention Complete (n = 23)",
+                          "Control Complete (n = 25)"))
+
+# Plot
+plot(consort)
+```
+
+### Table One
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tableone)
+library(knitr)
+library(kableExtra)
+
+# Load datasets
+completed <- read_excel("final_datasets/roybal_masterdoc.xlsx", sheet = 1)
+dropped <- read_excel("final_datasets/roybal_masterdoc.xlsx", sheet = 2)
+
+# Keep only these dropout IDs
+include_ids <- c("Roybal_08", "Roybal_09", "Roybal_10", "Roybal_20",
+                 "Roybal_22", "Roybal_23", "Roybal_37", "Roybal_42", "Roybal_55")
+dropped_filtered <- dropped %>% filter(id %in% include_ids)
+
+# Rename variables
+completed_clean <- completed %>%
+  rename(
+    `Age (years)` = age2,
+    `Biological Sex` = sex_cat,
+    `Gender Identity` = gender_cat,
+    Race = race_cat,
+    Ethnicity = ethnicity_cat,
+    `Time Since Injury (days)` = days_since_injury,
+    `Loss of Consciousness` = loc,
+    `Memory Gap` = memory_gap
+  )
+
+dropped_clean <- dropped_filtered %>%
+  rename(
+    `Age (years)` = age2,
+    `Biological Sex` = sex_cat,
+    `Gender Identity` = gender_cat,
+    Race = race_cat,
+    Ethnicity = ethnicity_cat,
+    `Time Since Injury (days)` = days_since_injury,
+    `Loss of Consciousness` = loc,
+    `Memory Gap` = memory_gap
+  )
+
+# Combine datasets
+df_table1 <- bind_rows(
+  completed_clean %>% mutate(group_status = group),
+  dropped_clean %>% mutate(group_status = "Dropout")
+)
+
+# Set factor order
+df_table1$group_status <- factor(df_table1$group_status,
+                                  levels = c("Intervention", "Control", "Dropout"))
+
+# Define variables
+vars <- c("Age (years)",
+          "Biological Sex",
+          "Gender Identity",
+          "Race",
+          "Ethnicity",
+          "Time Since Injury (days)",
+          "Loss of Consciousness",
+          "Memory Gap")
+
+catVars <- c("Biological Sex", "Gender Identity", "Race", "Ethnicity",
+             "Loss of Consciousness", "Memory Gap")
+
+# Create Table 1
+table1 <- CreateTableOne(
+  vars = vars,
+  strata = "group_status",
+  data = df_table1,
+  factorVars = catVars,
+  test = TRUE,
+  addOverall = TRUE
+)
+
+# Print with formatting
+table1_print <- print(table1,
+                      nonnormal = NULL,
+                      exact = NULL,
+                      quote = FALSE,
+                      noSpaces = TRUE,
+                      printToggle = FALSE,
+                      showAllLevels = TRUE,
+                      contDigits = 1,
+                      catDigits = 1,
+                      pDigits = 3,
+                      minMax = TRUE)
+
+# Make final table
+kable(table1_print,
+      caption = "Table 1: Baseline Characteristics by Group",
+      align = "lccccc") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12) %>%
+  column_spec(1, bold = TRUE, width = "15em")
+
+  # Convert to data frame first
+table1_df <- as.data.frame(table1_print)
+
+
+# Convert to flextable
+final_table <- flextable(table1_df) %>%
+  set_caption("Table 1: Baseline Characteristics by Group") %>%
+  bold(j = 1, part = "body") %>%  # Bold first column
+  bold(part = "header") %>%  # Bold headers
+  fontsize(size = 12, part = "all") %>%
+  autofit()
+
+# Save as Word
+save_as_docx(final_table, path = "table1.docx")
+```
+
+### Dropout and Retention Rate
+
+```{r}
+dropped_real <- dropped %>%
+  filter(id %in% c("Roybal_08", "Roybal_09", "Roybal_10", "Roybal_20",
+                   "Roybal_22", "Roybal_23", "Roybal_37", "Roybal_42", "Roybal_55"))
+
+n_enrolled <- nrow(completed) + nrow(dropped_real)
+n_completed <- nrow(completed)
+n_dropped <- nrow(dropped_real)
+
+data.frame(
+  Category = c("Total Enrolled", "Completed", "Dropped Out"),
+  N = c(n_enrolled, n_completed, n_dropped),
+  Percentage = paste0(round(c(100, n_completed/n_enrolled*100, n_dropped/n_enrolled*100), 1), "%")
+) %>%
+  kable(caption = "Enrollment and Retention") %>%
+  kable_styling()
+```
+
+### Dropout Rate Visualization
+
+```{r}
+dropped_real <- dropped %>%
+  filter(id %in% c("Roybal_08", "Roybal_09", "Roybal_10", "Roybal_20",
+                   "Roybal_22", "Roybal_23", "Roybal_37", "Roybal_42", "Roybal_55"))
+
+n_enrolled <- nrow(completed) + nrow(dropped_real)
+n_completed <- nrow(completed)
+n_dropped <- nrow(dropped_real)
+
+data.frame(
+  Category = factor(c("Enrolled", "Completed", "Dropped Out"),
+                   levels = c("Enrolled", "Completed", "Dropped Out")),
+  N = c(n_enrolled, n_completed, n_dropped),
+  Percentage = round(c(100, n_completed/n_enrolled*100, n_dropped/n_enrolled*100), 1)
+) %>%
+  ggplot(aes(x = Category, y = N, fill = Category)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = paste0(N, "\n(", Percentage, "%)")),
+            vjust = -0.3, fontface = "bold", size = 5) +
+  scale_fill_manual(values = c("Enrolled" = "#3b82f6",
+                                "Completed" = "#16a34a",
+                                "Dropped Out" = "#ef4444")) +
+  labs(
+    title = "Study Enrollment and Retention",
+    x = "",
+    y = "Number of Participants"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  ) +
+  ylim(0, n_enrolled + 5)
+```
+
+### Days between Baseline and Fitbit Setup/Call 0
+
+```{r}
+completed %>%
+  group_by(group) %>%
+  summarise(N = n(),
+            `Mean (SD)` = paste0(round(mean(days_between_baseline_call0, na.rm=T), 1),
+                                " (", round(sd(days_between_baseline_call0, na.rm=T), 1), ")")) %>%
+  bind_rows(completed %>%
+              summarise(group = "Overall", N = n(),
+                       `Mean (SD)` = paste0(round(mean(days_between_baseline_call0, na.rm=T), 1),
+                                           " (", round(sd(days_between_baseline_call0, na.rm=T), 1), ")"))) %>%
+  kable(caption = "Days Between Baseline and Fitbit Setup") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Days between Call 11 and Endpoint
+
+```{r}
+completed %>%
+  group_by(group) %>%
+  summarise(N = n(),
+            `Mean (SD)` = paste0(round(mean(days_between_call11_endpoint, na.rm=T), 1),
+                                " (", round(sd(days_between_call11_endpoint, na.rm=T), 1), ")")) %>%
+  bind_rows(completed %>%
+              summarise(group = "Overall", N = n(),
+                       `Mean (SD)` = paste0(round(mean(days_between_call11_endpoint, na.rm=T), 1),
+                                           " (", round(sd(days_between_call11_endpoint, na.rm=T), 1), ")"))) %>%
+  kable(caption = "Days Between Call 11 and Endpoint") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## Compliance
+
+### Phone Calls Made
+
+```{r}
+completed %>%
+  group_by(group) %>%
+  summarise(
+    N = n(),
+    `Completed Mean (SD)` = paste0(round(mean(total_completed_calls, na.rm=T), 1),
+                                   " (", round(sd(total_completed_calls, na.rm=T), 1), ")"),
+    `Completion Rate (%)` = paste0(round(mean(total_completed_calls/total_calls * 100, na.rm=T), 1), "%"),
+    `Missed Mean (SD)` = paste0(round(mean(total_missed_calls, na.rm=T), 1),
+                                " (", round(sd(total_missed_calls, na.rm=T), 1), ")")
+  ) %>%
+  bind_rows(completed %>%
+              summarise(
+                group = "Overall",
+                N = n(),
+                `Completed Mean (SD)` = paste0(round(mean(total_completed_calls, na.rm=T), 1),
+                                               " (", round(sd(total_completed_calls, na.rm=T), 1), ")"),
+                `Completion Rate (%)` = paste0(round(mean(total_completed_calls/total_calls * 100, na.rm=T), 1), "%"),
+                `Missed Mean (SD)` = paste0(round(mean(total_missed_calls, na.rm=T), 1),
+                                            " (", round(sd(total_missed_calls, na.rm=T), 1), ")")
+              )) %>%
+  kable(caption = "Phone Call Compliance (Total Scheduled = 11 calls)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Completion Rate Pie Chart
+
+```{r}
+library(ggpubr)
+
+# Create data for pie charts
+pie_data <- completed %>%
+  group_by(group) %>%
+  summarise(
+    Completed = sum(total_completed_calls, na.rm = TRUE),
+    Missed = sum(total_missed_calls, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = c(Completed, Missed), names_to = "Status", values_to = "Count") %>%
+  group_by(group) %>%
+  mutate(Percentage = round((Count / sum(Count)) * 100, 1))
+
+# Control pie
+p1 <- pie_data %>%
+  filter(group == "Control") %>%
+  ggpie("Count", label = paste0(pie_data$Count[pie_data$group=="Control"],
+                                 " (", pie_data$Percentage[pie_data$group=="Control"], "%)"),
+        fill = "Status", color = "white",
+        palette = c("#16a34a", "#D55E00"),
+        title = "Control")
+
+# Intervention pie
+p2 <- pie_data %>%
+  filter(group == "Intervention") %>%
+  ggpie("Count", label = paste0(pie_data$Count[pie_data$group=="Intervention"],
+                                 " (", pie_data$Percentage[pie_data$group=="Intervention"], "%)"),
+        fill = "Status", color = "white",
+        palette = c("#16a34a", "#D55E00"),
+        title = "Intervention")
+
+# Combine
+ggarrange(p1, p2, ncol = 2, common.legend = TRUE, legend = "bottom")
+```
+
+### Average Phone Call Length by Group
+
+```{r}
+# re-do with IQR
+completed %>%
+  mutate(
+    avg_call_minutes = sapply(average_call_length, function(x) {
+      parts <- as.numeric(strsplit(as.character(x), ":")[[1]])
+      if(length(parts) == 3) parts[1]*60 + parts[2] + parts[3]/60
+      else if(length(parts) == 2) parts[1] + parts[2]/60
+      else NA
+    })
+  ) %>%
+  group_by(group) %>%
+  summarise(
+    N = n(),
+    `Mean (SD)` = paste0(
+      round(mean(avg_call_minutes, na.rm=T), 1),
+      " (", round(sd(avg_call_minutes, na.rm=T), 1), ")"
+    ),
+    `Median (IQR)` = paste0(
+      round(median(avg_call_minutes, na.rm=T), 1),
+      " (", round(quantile(avg_call_minutes, 0.25, na.rm=T), 1),
+      "-", round(quantile(avg_call_minutes, 0.75, na.rm=T), 1), ")"
+    )
+  ) %>%
+  bind_rows(
+    completed %>%
+      mutate(
+        avg_call_minutes = sapply(average_call_length, function(x) {
+          parts <- as.numeric(strsplit(as.character(x), ":")[[1]])
+          if(length(parts) == 3) parts[1]*60 + parts[2] + parts[3]/60
+          else if(length(parts) == 2) parts[1] + parts[2]/60
+          else NA
+        })
+      ) %>%
+      summarise(
+        group = "Overall",
+        N = n(),
+        `Mean (SD)` = paste0(
+          round(mean(avg_call_minutes, na.rm=T), 1),
+          " (", round(sd(avg_call_minutes, na.rm=T), 1), ")"
+        ),
+        `Median (IQR)` = paste0(
+          round(median(avg_call_minutes, na.rm=T), 1),
+          " (", round(quantile(avg_call_minutes, 0.25, na.rm=T), 1),
+          "-", round(quantile(avg_call_minutes, 0.75, na.rm=T), 1), ")"
+        )
+      )
+  ) %>%
+  kable(caption = "Average Phone Call Length") %>%
+  kable_styling()
+```
+
+### Average Call Length by Group: GGstats plot
+
+```{r}
+library(ggstatsplot)
+
+# Boxplot with stats: Average Call Length by Group
+completed %>%
+  mutate(
+    avg_call_minutes = sapply(average_call_length, function(x) {
+      parts <- as.numeric(strsplit(as.character(x), ":")[[1]])
+      if(length(parts) == 3) parts[1]*60 + parts[2] + parts[3]/60
+      else if(length(parts) == 2) parts[1] + parts[2]/60
+      else NA
+    })
+  ) %>%
+  ggbetweenstats(
+    x = group,
+    y = avg_call_minutes,
+    title = "Average Call Length by Group",
+    xlab = "Group",
+    ylab = "Average Call Length (minutes)",
+    type = "non-parametric",
+    bf.message = FALSE,
+    pairwise.display = "significant",
+    package = "ggsci",
+    palette = "default_jco"
+  )
+```
+
+### Fitbit Wear Time Compliance
+
+```{r}
+completed %>%
+  group_by(group) %>%
+  summarise(
+    N = n(),
+    `Days with Data Mean (SD)` = paste0(
+      round(mean(days_with_data, na.rm=T), 1),
+      " (", round(sd(days_with_data, na.rm=T), 1), ")"
+    ),
+    `% of Expected Days` = paste0(
+      round(mean(percent_days_with_data, na.rm=T), 1), "%"
+    ),
+    `Mean Daily Wear Time (hours)` = paste0(
+      round(mean(mean_wear_time_hours, na.rm=T), 1),
+      " (", round(sd(mean_wear_time_hours, na.rm=T), 1), ")"
+    ),
+    `Valid Days ≥10hr Mean% (SD)` = paste0(
+      round(mean(percent_valid_min10hr, na.rm=T), 1),
+      " (", round(sd(percent_valid_min10hr, na.rm=T), 1), ")"
+    ),
+    `Daytime Wear % Mean (SD)` = paste0(
+      round(mean(mean_percent_wear_during_day, na.rm=T), 1),
+      " (", round(sd(mean_percent_wear_during_day, na.rm=T), 1), ")"
+    ),
+    `Nighttime Wear % Mean (SD)` = paste0(
+      round(mean(mean_percent_wear_during_night, na.rm=T), 1),
+      " (", round(sd(mean_percent_wear_during_night, na.rm=T), 1), ")"
+    )
+  ) %>%
+  bind_rows(completed %>%
+              summarise(
+                group = "Overall",
+                N = n(),
+                `Days with Data Mean (SD)` = paste0(
+                  round(mean(days_with_data, na.rm=T), 1),
+                  " (", round(sd(days_with_data, na.rm=T), 1), ")"
+                ),
+                `% of Expected Days` = paste0(
+                  round(mean(percent_days_with_data, na.rm=T), 1), "%"
+                ),
+                `Mean Daily Wear Time (hours)` = paste0(
+                  round(mean(mean_wear_time_hours, na.rm=T), 1),
+                  " (", round(sd(mean_wear_time_hours, na.rm=T), 1), ")"
+                ),
+                `Valid Days ≥10hr Mean% (SD)` = paste0(
+                  round(mean(percent_valid_min10hr, na.rm=T), 1),
+                  " (", round(sd(percent_valid_min10hr, na.rm=T), 1), ")"
+                ),
+                `Daytime Wear % Mean (SD)` = paste0(
+                  round(mean(mean_percent_wear_during_day, na.rm=T), 1),
+                  " (", round(sd(mean_percent_wear_during_day, na.rm=T), 1), ")"
+                ),
+                `Nighttime Wear % Mean (SD)` = paste0(
+                  round(mean(mean_percent_wear_during_night, na.rm=T), 1),
+                  " (", round(sd(mean_percent_wear_during_night, na.rm=T), 1), ")"
+                )
+              )) %>%
+  kable(caption = "Fitbit Wear Time Compliance") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+### Daily Wear Time by Group: GGstats plot
+
+```{r}
+library(ggstatsplot)
+
+ggbetweenstats(
+  data = completed,
+  x = group,
+  y = mean_wear_time_hours,
+  title = "Daily Fitbit Wear Time by Group",
+  xlab = "Group",
+  ylab = "Mean Daily Wear Time (hours)",
+  type = "non-parametric",
+  var.equal = FALSE,
+  bf.message = FALSE,
+  pairwise.display = "significant",
+  package = "ggsci",
+  palette = "default_jco"
+)
+```
+
+### Check normality for all continuous compliance variables
+
+```{r}
+library(ggplot2)
+
+# 1. Average Call Length
+completed_calls <- completed %>%
+  mutate(
+    avg_call_minutes = sapply(average_call_length, function(x) {
+      parts <- as.numeric(strsplit(as.character(x), ":")[[1]])
+      if(length(parts) == 3) parts[1]*60 + parts[2] + parts[3]/60
+      else if(length(parts) == 2) parts[1] + parts[2]/60
+      else NA
+    })
+  )
+
+# Histograms and Q-Q plots
+par(mfrow = c(2, 3))
+
+# Average call length
+hist(completed_calls$avg_call_minutes[completed_calls$group == "Control"],
+     main = "Control: Avg Call Length", xlab = "Minutes")
+hist(completed_calls$avg_call_minutes[completed_calls$group == "Intervention"],
+     main = "Intervention: Avg Call Length", xlab = "Minutes")
+
+# Mean daily wear time
+hist(completed$mean_wear_time_hours[completed$group == "Control"],
+     main = "Control: Daily Wear Time", xlab = "Hours")
+hist(completed$mean_wear_time_hours[completed$group == "Intervention"],
+     main = "Intervention: Daily Wear Time", xlab = "Hours")
+
+# Days with data
+hist(completed$days_with_data[completed$group == "Control"],
+     main = "Control: Days with Data", xlab = "Days")
+hist(completed$days_with_data[completed$group == "Intervention"],
+     main = "Intervention: Days with Data", xlab = "Days")
+
+par(mfrow = c(1, 1))
+
+# Shapiro-Wilk normality tests
+cat("\n=== NORMALITY TESTS (Shapiro-Wilk) ===\n")
+cat("p > 0.05 = normal distribution\n\n")
+
+cat("Average Call Length:\n")
+cat("  Control:", shapiro.test(completed_calls$avg_call_minutes[completed_calls$group == "Control"])$p.value, "\n")
+cat("  Intervention:", shapiro.test(completed_calls$avg_call_minutes[completed_calls$group == "Intervention"])$p.value, "\n\n")
+
+cat("Mean Daily Wear Time:\n")
+cat("  Control:", shapiro.test(completed$mean_wear_time_hours[completed$group == "Control"])$p.value, "\n")
+cat("  Intervention:", shapiro.test(completed$mean_wear_time_hours[completed$group == "Intervention"])$p.value, "\n\n")
+
+cat("Days with Data:\n")
+cat("  Control:", shapiro.test(completed$days_with_data[completed$group == "Control"])$p.value, "\n")
+cat("  Intervention:", shapiro.test(completed$days_with_data[completed$group == "Intervention"])$p.value, "\n")
+```
+
+### Non-Parametric Tests (Mann-Whitney U)
+
+```{r}
+# 1. Average Call Length
+completed_calls <- completed %>%
+  mutate(
+    avg_call_minutes = sapply(average_call_length, function(x) {
+      parts <- as.numeric(strsplit(as.character(x), ":")[[1]])
+      if(length(parts) == 3) parts[1]*60 + parts[2] + parts[3]/60
+      else if(length(parts) == 2) parts[1] + parts[2]/60
+      else NA
+    })
+  )
+
+test1 <- wilcox.test(avg_call_minutes ~ group, data = completed_calls)
+cat("Average Call Length: W =", test1$statistic, ", p =", round(test1$p.value, 3), "\n")
+
+# 2. Mean Daily Wear Time
+test2 <- wilcox.test(mean_wear_time_hours ~ group, data = completed)
+cat("Mean Daily Wear Time: W =", test2$statistic, ", p =", round(test2$p.value, 3), "\n")
+
+# 3. Days with Data
+test3 <- wilcox.test(days_with_data ~ group, data = completed)
+cat("Days with Data: W =", test3$statistic, ", p =", round(test3$p.value, 3), "\n")
+
+# 4. Valid Days ≥10hr
+test4 <- wilcox.test(percent_valid_min10hr ~ group, data = completed)
+cat("Valid Days ≥10hr (%): W =", test4$statistic, ", p =", round(test4$p.value, 3), "\n")
+
+# 5. Valid Days ≥80%
+test5 <- wilcox.test(percent_valid_wear80 ~ group, data = completed)
+cat("Valid Days ≥80% (%): W =", test5$statistic, ", p =", round(test5$p.value, 3), "\n")
+```
