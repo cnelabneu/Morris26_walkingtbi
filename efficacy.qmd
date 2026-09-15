@@ -481,6 +481,78 @@ ggplot(plot_data, aes(x = week, y = rate, color = group_label, group = group_lab
   ))
 ```
 
+#### Same figure sized for inline use in Word (5 in wide x 3 in tall)
+
+Same data and same geometry as the figure above — only the sizing is changed so it stays legible when placed inline in a Word document at 5 x 3 inches. Reuses `plot_data` and `sig_data` from the chunk above, so run that chunk first.
+
+Sizing choices, all driven by the fact that text does not scale with the figure box: type sizes are set in absolute points (axis text 9 pt, axis titles 10 pt bold, legend 8.2 pt) rather than inherited from a large `base_size`; lines are thickened relative to the panel; the legend is forced to a single row with small keys so it costs ~0.35 in of height instead of stacking; and axis lines/ticks are drawn explicitly because `theme_minimal`'s grid alone reads as washed out at this scale. The y limit is set from the significance-marker positions so the week-12 `***` is not clipped (it is, at the default expansion).
+
+```{r fig-model12-word, fig.width=5, fig.height=3, dpi=600, out.width="5in"}
+pal_word <- c(
+  "Control (Total)"        = "#A8DCD1",
+  "Intervention (Total)"   = "#FFBE6A",
+  "Intervention (Planned)" = "#D55E00"
+)
+
+# Fix legend order (otherwise alphabetical puts Planned before Total)
+plot_data_word <- plot_data %>%
+  mutate(group_label = factor(group_label, levels = names(pal_word)))
+
+# Headroom so the highest significance marker is not clipped
+y_top <- max(sig_data$rate) + 0.55
+
+p_word <- ggplot(plot_data_word,
+                 aes(x = week, y = rate, color = group_label, group = group_label)) +
+  geom_ribbon(aes(ymin = asymp.LCL, ymax = asymp.UCL, fill = group_label),
+              alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_text(data = sig_data, aes(x = week, y = rate, label = label),
+            color = "black", size = 3.5, inherit.aes = FALSE, vjust = 0.25) +
+  # To put the three markers at one constant height instead of stepping up with the
+  # rising CI, swap the geom_text above for:
+  #   geom_text(data = transform(sig_data, rate = max(sig_data$rate)), ...)
+  scale_x_continuous(breaks = 1:12, expand = expansion(mult = c(0.025, 0.025))) +
+  scale_y_continuous(breaks = seq(0, 9, 1), limits = c(0, y_top),
+                     expand = expansion(mult = c(0.015, 0))) +
+  scale_color_manual(values = pal_word) +
+  scale_fill_manual(values = pal_word) +
+  labs(x = "Week", y = "Estimated Weekly Walks", color = NULL, fill = NULL) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE,
+                              keywidth = unit(0.42, "cm"),
+                              keyheight = unit(0.22, "cm"))) +
+  theme_minimal(base_size = 9) +
+  theme(
+    axis.text         = element_text(size = 9, color = "black"),
+    axis.title        = element_text(size = 10, face = "bold"),
+    axis.line         = element_line(linewidth = 0.4, color = "black"),
+    axis.ticks        = element_line(linewidth = 0.35, color = "black"),
+    axis.ticks.length = unit(0.09, "cm"),
+    panel.grid.minor  = element_blank(),
+    panel.grid.major  = element_line(linewidth = 0.25, color = "grey88"),
+    legend.position   = "bottom",
+    legend.text       = element_text(size = 8.2),
+    legend.margin     = margin(t = -4, b = 0),
+    legend.box.spacing = unit(0.1, "cm"),
+    plot.margin       = margin(t = 4, r = 6, b = 1, l = 2)
+  )
+
+p_word
+```
+
+```{r}
+# Write the file to insert into Word. 600 dpi PNG is safe for both print and screen;
+# insert at 100% scale (do NOT let Word resize it, or the type sizes above are wasted).
+dir.create("figures", showWarnings = FALSE)
+
+ggsave("figures/model1_2_combined_word_5x3.png", p_word,
+       width = 5, height = 3, units = "in", dpi = 600, bg = "white")
+
+# For a journal wanting vector art / lossless, use one of:
+# ggsave("figures/model1_2_combined_word_5x3.pdf",  p_word, width = 5, height = 3)
+# ggsave("figures/model1_2_combined_word_5x3.tiff", p_word, width = 5, height = 3,
+#        dpi = 600, compression = "lzw", bg = "white")
+```
+
 ### Model 2: Bar plot with individual data points for each week
 
 ```{r}

@@ -17,9 +17,19 @@ load("roybal_base.RData")
 environment_vars <- completed %>%
   select(id, pc_park, urban_type, NatWalkInd)
 
+# All six BREQ-3 regulation subscales, pre and post. All twelve are already present and
+# fully populated (48/48) in `completed` straight from final_datasets/roybal_masterdoc.xlsx
+# — build_data.R reads that sheet wholesale, so nothing needs adding upstream. Earlier
+# versions of this chunk selected only intrinsic + amotivation, which is why the rest
+# never reached the analysis dataframes.
+breq3_subscales <- c("amotivation", "external", "introjected",
+                     "identified", "integrated", "intrinsic")
+breq3_vars <- c(paste0("breq3_", breq3_subscales, "_baseline"),
+                paste0("breq3_", breq3_subscales, "_endpoint"))
+
 base_vars <- completed %>%
   select(id, cog_func_tscore, gph_tscore, gmh_tscore, total_MET_min,
-         breq3_intrinsic_baseline, breq3_amotivation_baseline,
+         all_of(breq3_vars),
          selfeff_total_score_baseli, age2, sex_cat, years_of_ed, days_since_injury)
 
 mod_vars <- left_join(base_vars, environment_vars)
@@ -27,7 +37,7 @@ mod_vars <- left_join(base_vars, environment_vars)
 # Scale person-level vars
 mod_vars <- mod_vars %>%
   mutate(across(c(NatWalkInd, pc_park, cog_func_tscore, gph_tscore, gmh_tscore,
-                  breq3_intrinsic_baseline, breq3_amotivation_baseline,
+                  all_of(breq3_vars),
                   selfeff_total_score_baseli, age2, years_of_ed, days_since_injury),
                 ~ as.numeric(scale(.)),
                 .names = "{.col}_z"))
@@ -944,4 +954,383 @@ enet_cv_preds %>%
     x        = "1 - Specificity",
     y        = "Sensitivity"
   )
+```
+------------------------------------------------------------------------
+
+# Motivation & Self-Efficacy Outcomes: Intervention Effect and Mediation
+
+**Purpose:** Two sets of models. First, the pre-post effect of the intervention versus control on all six BREQ-3 regulation subscales plus exercise self-efficacy (treating these as *outcomes*), reported with within-group simple slopes. Second, two simple mediation models asking whether pre-post change in amotivation or in intrinsic motivation mediates the intervention effect on total walks.
+
+Note this is a different role for these variables than the `mod_motivation` model earlier in this document, which used *baseline* motivation as a predictor/modifier of daily walking.
+
+```{r}
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(broom.mixed)
+
+pal_grp <- c("Control" = "#0072B2", "Intervention" = "#D55E00")
+
+# Seven outcomes: six BREQ-3 regulation subscales + exercise self-efficacy.
+# Self-efficacy is on a different native scale from the BREQ-3 subscales, which is
+# part of why all outcomes are standardised below.
+outcome_specs <- tribble(
+  ~measure,          ~v_baseline,                    ~v_endpoint,
+  "Amotivation",     "breq3_amotivation_baseline",   "breq3_amotivation_endpoint",
+  "External",        "breq3_external_baseline",      "breq3_external_endpoint",
+  "Introjected",     "breq3_introjected_baseline",   "breq3_introjected_endpoint",
+  "Identified",      "breq3_identified_baseline",    "breq3_identified_endpoint",
+  "Integrated",      "breq3_integrated_baseline",    "breq3_integrated_endpoint",
+  "Intrinsic",       "breq3_intrinsic_baseline",     "breq3_intrinsic_endpoint",
+  "Self-efficacy",   "selfeff_total_score_baseli",   "selfeff_total_score_endpoi"
+)
+```
+
+## Part 1 — Pre-post effect of intervention vs control (z-scored outcomes)
+
+One linear mixed model per outcome: `score_z ~ group * time + (1 | id)`, where `time` is baseline vs endpoint. Two quantities are reported:
+
+-   **Group × Time interaction** — the differential pre-post change in the intervention arm relative to control. This is the primary estimand.
+-   **Simple slopes** — the within-group pre-post change (Endpoint − Baseline) *separately* for each arm, from the same fit. The interaction is exactly the difference between these two simple slopes.
+
+Because seven outcomes are tested, p-values are additionally reported with Benjamini-Hochberg FDR correction.
+
+### How the standardisation is done, and why it matters
+
+Each outcome is z-scored **pooling both timepoints together** (one mean and one SD per measure, applied to baseline and endpoint alike). This is deliberate and is *not* the same as the `_z` columns built in the data-prep chunk at the top of this document, which scale each column separately.
+
+Scaling baseline and endpoint separately would force each timepoint to have mean 0, which **removes the pre-post change entirely** — the very thing these models estimate. For example, intrinsic motivation rises 0.161 points raw, but after per-column scaling that shift becomes exactly 0. Pooled scaling preserves the change and simply re-expresses it in SD units of the measure. Because standardising an outcome is a linear rescaling, all test statistics and p-values are identical to the raw-score analysis; only the units of the estimates change (verified below).
+
+```{r}
+motiv_long <- outcome_specs %>%
+  pmap_dfr(function(measure, v_baseline, v_endpoint) {
+    completed %>%
+      transmute(id, group,
+                measure  = measure,
+                Baseline = .data[[v_baseline]],
+                Endpoint = .data[[v_endpoint]])
+  }) %>%
+  pivot_longer(c(Baseline, Endpoint), names_to = "time", values_to = "score_raw") %>%
+  # Pooled z-scoring: one mean/SD per measure across BOTH timepoints, so the
+  # pre-post shift is retained (see note above).
+  group_by(measure) %>%
+  mutate(score_z = as.numeric(scale(score_raw))) %>%
+  ungroup() %>%
+  mutate(time    = factor(time, levels = c("Baseline", "Endpoint")),
+         group   = factor(group, levels = c("Control", "Intervention")),
+         measure = factor(measure, levels = outcome_specs$measure))
+
+cat("rows:", nrow(motiv_long), "| ids:", n_distinct(motiv_long$id),
+    "| measures:", nlevels(motiv_long$measure), "\n")
+
+# Observed cell means with 95% CIs (one-sample t intervals)
+motiv_long %>%
+  group_by(measure, time) %>%
+  summarise(n = n(), mean_z = mean(score_z),
+            se = sd(score_z) / sqrt(n()), .groups = "drop") %>%
+  mutate(ci_low  = mean_z - qt(0.975, n - 1) * se,
+         ci_high = mean_z + qt(0.975, n - 1) * se) %>%
+  select(measure, time, n, mean_z, se, ci_low, ci_high) %>%
+  kbl(digits = 3, caption = "Observed mean z-score by timepoint, with 95% CI") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# Confirm the pooled scaling kept the pre-post shift that per-column scaling destroys.
+# CI here is a paired interval on the within-person change, pooled across both arms.
+motiv_long %>%
+  select(id, measure, time, score_z) %>%
+  pivot_wider(names_from = time, values_from = score_z) %>%
+  mutate(change_z = Endpoint - Baseline) %>%
+  group_by(measure) %>%
+  summarise(n = n(), shift_z = mean(change_z),
+            se = sd(change_z) / sqrt(n()), .groups = "drop") %>%
+  mutate(ci_low  = shift_z - qt(0.975, n - 1) * se,
+         ci_high = shift_z + qt(0.975, n - 1) * se,
+         t_stat  = shift_z / se,
+         p.value = 2 * pt(-abs(t_stat), df = n - 1)) %>%
+  select(measure, n, shift_z, se, ci_low, ci_high, t_stat, p.value) %>%
+  kbl(digits = 3,
+      caption = "Overall pre-post shift in SD units with 95% CI (shift != 0 confirms change is retained)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+fit_prepost <- function(msr) {
+  d <- motiv_long %>% filter(measure == msr)
+  m <- lmer(score_z ~ group * time + (1 | id), data = d)
+
+  tid <- broom.mixed::tidy(m, effects = "fixed") %>%
+    filter(term == "groupIntervention:timeEndpoint")
+
+  # Simple slopes: within-group pre-post change, one per arm
+  slopes <- contrast(emmeans(m, ~ time | group), "revpairwise", by = "group") %>%
+    summary(infer = c(TRUE, TRUE)) %>%
+    as.data.frame() %>%
+    mutate(measure = msr)
+
+  # Estimated marginal means at each group x time cell
+  cells <- as.data.frame(emmeans(m, ~ time | group)) %>% mutate(measure = msr)
+
+  list(model  = m,
+       inter  = tibble(measure = msr, estimate = tid$estimate, std.error = tid$std.error,
+                       df = tid$df, statistic = tid$statistic, p.value = tid$p.value),
+       slopes = slopes,
+       cells  = cells)
+}
+
+prepost <- map(levels(motiv_long$measure), fit_prepost) %>%
+  set_names(levels(motiv_long$measure))
+
+# CIs are t-based on the model's Satterthwaite df (not a normal +/- 1.96 approximation),
+# so they are consistent with the emmeans-derived intervals in the tables below.
+# NOTE: these intervals correspond to the UNADJUSTED p-values. They are not widened for
+# the seven-outcome FDR correction, so a CI can exclude zero while p_fdr > .05.
+inter_tbl <- map_dfr(prepost, "inter") %>%
+  mutate(ci_low  = estimate - qt(0.975, df) * std.error,
+         ci_high = estimate + qt(0.975, df) * std.error,
+         p_fdr   = p.adjust(p.value, method = "BH"))
+
+inter_tbl %>%
+  select(measure, estimate, std.error, ci_low, ci_high, statistic, df, p.value, p_fdr) %>%
+  kbl(digits = 3,
+      caption = "Group x Time interaction (SD units) with 95% CI: differential pre-post change, Intervention vs Control") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Simple slopes: within-group pre-post change
+
+The within-group marginal effect of time, estimated separately in each arm. A slope whose CI excludes zero indicates that arm changed significantly from baseline to endpoint on its own.
+
+```{r}
+slopes_tbl <- map_dfr(prepost, "slopes") %>%
+  select(measure, group, slope = estimate, SE, df,
+         ci_low = lower.CL, ci_high = upper.CL, t.ratio, p.value) %>%
+  mutate(measure = factor(measure, levels = outcome_specs$measure)) %>%
+  arrange(measure, group)
+
+slopes_tbl %>%
+  kbl(digits = 3,
+      caption = "Simple slopes (SD units) with 95% CI: Endpoint - Baseline within each arm") %>%
+  kable_styling(full_width = FALSE) %>%
+  pack_rows(index = table(slopes_tbl$measure))
+```
+
+```{r}
+# Estimated marginal means at each group x time cell, with 95% CIs
+map_dfr(prepost, "cells") %>%
+  select(measure, group, time, emmean, SE, df,
+         ci_low = lower.CL, ci_high = upper.CL) %>%
+  mutate(measure = factor(measure, levels = outcome_specs$measure)) %>%
+  arrange(measure, group, time) %>%
+  kbl(digits = 3,
+      caption = "Estimated marginal means (SD units) with 95% CI, by group and timepoint") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# Verification 1: the interaction is exactly the difference in simple slopes
+slope_diff_check <- slopes_tbl %>%
+  select(measure, group, slope) %>%
+  pivot_wider(names_from = group, values_from = slope) %>%
+  mutate(diff_of_slopes = Intervention - Control) %>%
+  left_join(inter_tbl %>% select(measure, interaction = estimate), by = "measure") %>%
+  mutate(max_abs_discrepancy = abs(diff_of_slopes - interaction))
+print(as.data.frame(slope_diff_check %>% mutate(across(where(is.numeric), ~round(., 8)))))
+
+# Verification 2: z-scoring is a linear rescaling, so p-values match the raw-score models
+raw_p <- map_dbl(levels(motiv_long$measure), function(msr) {
+  d <- motiv_long %>% filter(measure == msr)
+  broom.mixed::tidy(lmer(score_raw ~ group * time + (1 | id), data = d),
+                    effects = "fixed") %>%
+    filter(term == "groupIntervention:timeEndpoint") %>% pull(p.value)
+})
+cat("\nMax |p(z-scored) - p(raw)| across the seven outcomes:",
+    max(abs(inter_tbl$p.value - raw_p)), "\n")
+```
+
+### Scatter plots: baseline vs endpoint by group
+
+Each panel plots endpoint against baseline for one outcome, in SD units. The dashed 45-degree line is "no change": points above it increased, below it decreased. Group-specific regression lines sitting apart vertically indicate a differential pre-post effect (i.e. a non-zero interaction above).
+
+```{r fig-breq-prepost, fig.width=10, fig.height=6}
+motiv_wide <- motiv_long %>%
+  select(id, group, measure, time, score_z) %>%
+  pivot_wider(names_from = time, values_from = score_z)
+
+ggplot(motiv_wide, aes(x = Baseline, y = Endpoint, color = group, fill = group)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.4) +
+  geom_point(size = 1.8, alpha = 0.75) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE,
+              linewidth = 0.7, alpha = 0.15) +
+  facet_wrap(~ measure, nrow = 2) +
+  scale_color_manual(values = pal_grp) +
+  scale_fill_manual(values = pal_grp) +
+  labs(x = "Baseline (SD units)", y = "Endpoint (SD units)", color = NULL, fill = NULL,
+       title = "Motivation and self-efficacy: baseline vs endpoint by group",
+       subtitle = "Z-scored pooling both timepoints; dashed line = no change") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey94", color = NA),
+        strip.text = element_text(face = "bold", size = 10))
+```
+
+### Simple slopes plot
+
+The same within-group slopes as the table above, plotted so the two arms can be compared directly. Where the two intervals overlap heavily, the interaction is near zero.
+
+```{r fig-simple-slopes, fig.width=8, fig.height=5}
+ggplot(slopes_tbl, aes(x = slope, y = fct_rev(measure), color = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.4) +
+  geom_pointrange(aes(xmin = ci_low, xmax = ci_high),
+                  position = position_dodge(width = 0.55),
+                  size = 0.45, linewidth = 0.6) +
+  scale_color_manual(values = pal_grp) +
+  labs(x = "Within-group pre-post change (SD units, Endpoint - Baseline)",
+       y = NULL, color = NULL,
+       title = "Simple slopes by arm",
+       subtitle = "Intervals excluding zero indicate significant within-arm change") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+```
+
+## Part 2 — Mediation: does change in amotivation or intrinsic motivation mediate the effect on total walks?
+
+Two simple mediation models, `X -> M -> Y`:
+
+-   **X** = group (Control = 0, Intervention = 1)
+-   **M** = pre-post change in the mediator (endpoint − baseline), one model for amotivation and one for intrinsic motivation
+-   **Y** = total walks, weeks 1-12 (person-level count)
+
+Each model adjusts for the **baseline value of the mediator** in both the a-path and the b-path. Change scores are correlated with their own baseline (strongly here, given floor/ceiling effects), so leaving baseline out would confound both paths.
+
+Inference on the indirect effect uses a **nonparametric bootstrap percentile CI** (5,000 resamples) rather than a normal-theory test, because the product `a*b` is not normally distributed. The bootstrap also protects the inference against the heteroscedasticity of the raw count outcome.
+
+```{r}
+walks_person <- weekly_walks %>%
+  filter(week <= 12) %>%
+  group_by(id) %>%
+  summarise(total_walks = sum(weekly_walks, na.rm = TRUE), .groups = "drop")
+
+med_dat <- completed %>%
+  select(id, group,
+         amot_pre = breq3_amotivation_baseline, amot_post = breq3_amotivation_endpoint,
+         intr_pre = breq3_intrinsic_baseline,   intr_post = breq3_intrinsic_endpoint) %>%
+  left_join(walks_person, by = "id") %>%
+  mutate(X      = as.integer(factor(group, levels = c("Control", "Intervention"))) - 1L,
+         d_amot = amot_post - amot_pre,
+         d_intr = intr_post - intr_pre) %>%
+  filter(!is.na(total_walks), !is.na(d_amot), !is.na(d_intr))
+
+cat("Mediation analytic n:", nrow(med_dat), "\n")
+
+med_dat %>%
+  group_by(group) %>%
+  summarise(n = n(),
+            mean_change_amot = mean(d_amot), mean_change_intr = mean(d_intr),
+            mean_total_walks = mean(total_walks), .groups = "drop") %>%
+  kbl(digits = 3, caption = "Mediator change and outcome by group") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+# a-path: M ~ X + baseline(M)
+# b-path: Y ~ M + X + baseline(M)   (b = mediator effect; X coefficient = direct effect)
+# total:  Y ~ X + baseline(M)
+run_mediation <- function(dat, m_var, m_pre, y_var = "total_walks",
+                          nboot = 5000, seed = 42) {
+  f_a <- reformulate(c("X", m_pre),        response = m_var)
+  f_b <- reformulate(c(m_var, "X", m_pre), response = y_var)
+  f_c <- reformulate(c("X", m_pre),        response = y_var)
+
+  est <- function(d) {
+    a  <- coef(lm(f_a, data = d))[["X"]]
+    mb <- lm(f_b, data = d)
+    b  <- coef(mb)[[m_var]]
+    cp <- coef(mb)[["X"]]
+    c(a = a, b = b, indirect = a * b, direct = cp,
+      total = coef(lm(f_c, data = d))[["X"]])
+  }
+
+  point <- est(dat)
+  set.seed(seed)
+  boot <- replicate(nboot, {
+    d <- dat[sample(nrow(dat), replace = TRUE), ]
+    tryCatch(est(d), error = function(e) rep(NA_real_, 5))
+  })
+  ci <- apply(boot, 1, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+
+  tibble(term = names(point), estimate = point,
+         boot_se = apply(boot, 1, sd, na.rm = TRUE),
+         ci_low = ci[1, ], ci_high = ci[2, ]) %>%
+    mutate(crosses_zero = ci_low <= 0 & ci_high >= 0)
+}
+
+med_amot <- run_mediation(med_dat, "d_amot", "amot_pre")
+med_intr <- run_mediation(med_dat, "d_intr", "intr_pre")
+
+bind_rows(
+  med_amot %>% mutate(mediator = "Change in amotivation"),
+  med_intr %>% mutate(mediator = "Change in intrinsic motivation")
+) %>%
+  select(mediator, term, estimate, boot_se, ci_low, ci_high, crosses_zero) %>%
+  kbl(digits = 3,
+      caption = "Mediation results (bootstrap percentile CIs, 5000 resamples). Outcome = total walks, weeks 1-12") %>%
+  kable_styling(full_width = FALSE) %>%
+  pack_rows(index = c("Change in amotivation" = 5, "Change in intrinsic motivation" = 5))
+```
+
+```{r}
+# Component models behind the two mediations
+for (spec in list(c("d_amot", "amot_pre", "Amotivation"),
+                  c("d_intr", "intr_pre", "Intrinsic motivation"))) {
+  cat("\n========== ", spec[3], " ==========\n", sep = "")
+  cat("--- a-path ---\n")
+  print(round(summary(lm(reformulate(c("X", spec[2]), response = spec[1]),
+                         data = med_dat))$coefficients, 4))
+  cat("--- b-path (X coefficient here is the direct effect) ---\n")
+  print(round(summary(lm(reformulate(c(spec[1], "X", spec[2]), response = "total_walks"),
+                         data = med_dat))$coefficients, 4))
+}
+```
+
+### b-path added-variable plots
+
+These are **added-variable (partial residual) plots**, not raw scatters: both axes are residualised on group and baseline mediator, so the slope of each fitted line is exactly the `b` coefficient from the mediation model (verified in the output below). A raw scatter of mediator change against total walks is misleading here, because group is by far the dominant driver of walks and the reported `b` is a *partial* coefficient.
+
+```{r fig-breq-bpath, fig.width=8, fig.height=4}
+av_data <- function(dat, m_var, m_pre, label) {
+  ry <- resid(lm(reformulate(c("X", m_pre), response = "total_walks"), data = dat))
+  rm <- resid(lm(reformulate(c("X", m_pre), response = m_var),         data = dat))
+  b  <- coef(lm(reformulate(c(m_var, "X", m_pre), response = "total_walks"),
+                data = dat))[[m_var]]
+  cat(label, "— added-variable slope:", round(coef(lm(ry ~ rm))[2], 4),
+      "| model b:", round(b, 4), "\n")
+  tibble(mediator = label, m_resid = rm, y_resid = ry, group = dat$group)
+}
+
+av <- bind_rows(
+  av_data(med_dat, "d_amot", "amot_pre", "Amotivation"),
+  av_data(med_dat, "d_intr", "intr_pre", "Intrinsic")
+)
+
+ggplot(av, aes(x = m_resid, y = y_resid)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70", linewidth = 0.4) +
+  geom_point(aes(color = group), size = 2, alpha = 0.8) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE,
+              color = "black", linewidth = 0.7, alpha = 0.15) +
+  facet_wrap(~ mediator, nrow = 1, scales = "free_x") +
+  scale_color_manual(values = pal_grp) +
+  labs(x = "Mediator change | group, baseline (residual)",
+       y = "Total walks | group, baseline (residual)", color = NULL,
+       title = "b-path added-variable plots",
+       subtitle = "Slope of each fitted line equals the b coefficient in the mediation model") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey94", color = NA),
+        strip.text = element_text(face = "bold", size = 10))
 ```
